@@ -709,7 +709,7 @@ public sealed class Plugin : IDalamudPlugin
             if (debugThisRun)
                 Log.Information($"[BSE] Party index {state.PartyIndex} name={state.PartyMemberName}: matched UI row node id {rowNode->NodeId}.");
 
-            ApplyPartyListStatusVisibilityOnly(rowNode, state.HiddenSlotIndexes);
+            ApplyPartyListStatusCompact(rowNode, state.HiddenSlotIndexes, state.PartyListSlotStatusIds.Count);
         }
     }
 
@@ -958,7 +958,7 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        ApplyPartyListStatusVisibilityOnly(rowNode, hiddenSoloSlotIndexes);
+        ApplyPartyListStatusCompact(rowNode, hiddenSoloSlotIndexes, soloStatusSlotIds.Count);
     }
 
     private static List<uint> GetBattleCharaVisibleStatusIds(IBattleChara battleChara)
@@ -1117,9 +1117,10 @@ public sealed class Plugin : IDalamudPlugin
                (node->NodeId == 18 || IsPartyStatusCloneNode(node->NodeId));
     }
 
-    private unsafe void ApplyPartyListStatusVisibilityOnly(
+    private unsafe void ApplyPartyListStatusCompact(
         AtkResNode* partyRowNode,
-        HashSet<int> hiddenSlotIndexes)
+        HashSet<int> hiddenSlotIndexes,
+        int renderedSlotCount)
     {
         if (partyRowNode == null)
             return;
@@ -1133,6 +1134,9 @@ public sealed class Plugin : IDalamudPlugin
         if (component == null)
             return;
 
+        var safeRenderedSlotCount = Math.Clamp(renderedSlotCount, 0, MaxPartyStatusSlots);
+        var compactSlotIndex = 0;
+
         for (var slotIndex = 0; slotIndex < MaxPartyStatusSlots; slotIndex++)
         {
             var childIndex = FirstPartyStatusChildIndex + slotIndex;
@@ -1145,9 +1149,35 @@ public sealed class Plugin : IDalamudPlugin
             if (!IsPartyStatusIconNode(statusNode))
                 continue;
 
+            if (slotIndex >= safeRenderedSlotCount)
+                continue;
+
             if (hiddenSlotIndexes.Contains(slotIndex))
+            {
                 HidePartyStatusSlotVisibilityOnly(statusNode);
+                continue;
+            }
+
+            MovePartyStatusSlotToCompactPosition(statusNode, compactSlotIndex);
+            compactSlotIndex++;
         }
+    }
+
+    private unsafe void MovePartyStatusSlotToCompactPosition(
+        AtkResNode* statusNode,
+        int compactSlotIndex)
+    {
+        if (statusNode == null)
+            return;
+
+        var compactX = (short)(PartyStatusSlotBaseX + (compactSlotIndex * PartyStatusSlotSpacingX));
+
+        SetNodeGeometryForBseIfDifferent(
+            statusNode,
+            compactX,
+            PartyStatusSlotY,
+            PartyStatusSlotWidth,
+            PartyStatusSlotHeight);
     }
 
     private unsafe void HidePartyStatusSlotVisibilityOnly(AtkResNode* statusNode)
@@ -1182,17 +1212,51 @@ public sealed class Plugin : IDalamudPlugin
         if (node == null)
             return;
 
+        CapturePartyStatusNodeSnapshotIfNeeded(node);
+        node->ToggleVisibility(false);
+    }
+
+    private unsafe void SetNodeGeometryForBseIfDifferent(
+        AtkResNode* node,
+        short x,
+        short y,
+        ushort width,
+        ushort height)
+    {
+        if (node == null)
+            return;
+
+        if (node->X == x &&
+            node->Y == y &&
+            node->Width == width &&
+            node->Height == height)
+            return;
+
+        CapturePartyStatusNodeSnapshotIfNeeded(node);
+
+        node->SetPositionFloat(x, y);
+        node->Width = width;
+        node->Height = height;
+    }
+
+    private unsafe void CapturePartyStatusNodeSnapshotIfNeeded(AtkResNode* node)
+    {
+        if (node == null)
+            return;
+
         var address = (nint)node;
 
-        if (!hiddenPartyStatusNodeSnapshots.ContainsKey(address))
-        {
-            hiddenPartyStatusNodeSnapshots[address] = new PartyStatusNodeSnapshot
-            {
-                WasVisible = node->IsVisible(),
-            };
-        }
+        if (hiddenPartyStatusNodeSnapshots.ContainsKey(address))
+            return;
 
-        node->ToggleVisibility(false);
+        hiddenPartyStatusNodeSnapshots[address] = new PartyStatusNodeSnapshot
+        {
+            WasVisible = node->IsVisible(),
+            X = node->X,
+            Y = node->Y,
+            Width = node->Width,
+            Height = node->Height,
+        };
     }
 
     private unsafe void RestorePartyStatusSlotIfBseHidIt(AtkResNode* statusNode)
@@ -1232,7 +1296,11 @@ public sealed class Plugin : IDalamudPlugin
         if (!hiddenPartyStatusNodeSnapshots.TryGetValue(address, out var snapshot))
             return;
 
+        node->SetPositionFloat(snapshot.X, snapshot.Y);
+        node->Width = snapshot.Width;
+        node->Height = snapshot.Height;
         node->ToggleVisibility(snapshot.WasVisible);
+
         hiddenPartyStatusNodeSnapshots.Remove(address);
     }
 
@@ -1409,14 +1477,13 @@ public sealed class Plugin : IDalamudPlugin
             node->Height == height)
             return;
 
-        node->X = x;
-        node->Y = y;
+        node->SetPositionFloat(x, y);
         node->Width = width;
         node->Height = height;
 
         changedCount++;
     }
-
+    
     private unsafe void DumpPartyListDebug(AtkUnitBase* addon)
     {
         if (addon == null)
@@ -1438,7 +1505,7 @@ public sealed class Plugin : IDalamudPlugin
         Log.Information($"[BSE] Hidden status icon IDs loaded: {hiddenStatusIconIds.Count}");
         Log.Information($"[BSE] Hidden status IDs: {FormatStatusIds(hiddenStatusIds.OrderBy(id => id))}");
         Log.Information($"[BSE] Hidden icon IDs: {string.Join(", ", hiddenStatusIconIds.OrderBy(id => id))}");
-        Log.Information("[BSE] NOTE: hiding uses COMBAT-SAFE raw status order. It preserves priority-0 combat buffs like Bloodbath and Arm's Length so hidden statuses cannot shift over them.");
+        Log.Information("[BSE] NOTE: hiding uses COMBAT-SAFE raw status order. It preserves priority-0 combat buffs like Bloodbath and Arm's Length so hidden statuses cannot shift over them. Compaction moves visible UI nodes left after hidden slots.");
 
         var partyCount = Math.Min(PartyList.Length, 8);
 
@@ -1668,6 +1735,10 @@ public sealed class Plugin : IDalamudPlugin
     private sealed class PartyStatusNodeSnapshot
     {
         public bool WasVisible { get; set; }
+        public float X { get; set; }
+        public float Y { get; set; }
+        public ushort Width { get; set; }
+        public ushort Height { get; set; }
     }
 
     private sealed class StatusCategoryEntry
