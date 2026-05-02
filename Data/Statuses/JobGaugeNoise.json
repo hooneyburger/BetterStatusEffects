@@ -145,6 +145,26 @@
   "DefaultBehavior": "HideFromOthers",
   "Reason": "Selfish Samurai ability.",
   "Notes": ""
+},
+
+
+{
+  "Id": 1233,
+  "Name": "Meikyo Shisui",
+  "Category": "JobGaugeNoise",
+  "DefaultBehavior": "HideFromOthers",
+  "Reason": "Selfish Samurai ability.",
+  "Notes": "",
+  "IconAliases": [219642]
+},
+
+{
+  "Id": 2959,
+  "Name": "Ogi Namikiri",
+  "Category": "JobGaugeNoise",
+  "DefaultBehavior": "HideFromOthers",
+  "Reason": "Selfish Samurai ability.",
+  "Notes": ""
 }
 
 
