@@ -607,28 +607,36 @@ public sealed class Plugin : IDalamudPlugin
         return hiddenStatusIdsCache;
     }
 
-    private HashSet<uint> LoadHiddenStatusIconIds()
+   private HashSet<uint> LoadHiddenStatusIconIds()
+{
+    if (hiddenStatusIconIdsCache != null)
+        return hiddenStatusIconIdsCache;
+
+    var hiddenEntries = LoadStatusCategoryEntries()
+        .Where(entry => string.Equals(entry.DefaultBehavior, "HideFromOthers", StringComparison.OrdinalIgnoreCase))
+        .ToList();
+
+    var statusSheet = DataManager.GetExcelSheet<Status>();
+    var iconIds = new HashSet<uint>();
+
+    foreach (var entry in hiddenEntries)
     {
-        if (hiddenStatusIconIdsCache != null)
-            return hiddenStatusIconIdsCache;
-
-        var hiddenStatusIds = LoadHiddenStatusIds();
-        var statusSheet = DataManager.GetExcelSheet<Status>();
-
-        var iconIds = new HashSet<uint>();
-
-        foreach (var statusId in hiddenStatusIds)
+        if (statusSheet.TryGetRow(entry.Id, out var statusRow))
         {
-            if (!statusSheet.TryGetRow(statusId, out var statusRow))
-                continue;
-
             if (statusRow.Icon != 0)
                 iconIds.Add(statusRow.Icon);
         }
 
-        hiddenStatusIconIdsCache = iconIds;
-        return hiddenStatusIconIdsCache;
+        foreach (var aliasIconId in entry.IconAliases)
+        {
+            if (aliasIconId != 0)
+                iconIds.Add(aliasIconId);
+        }
     }
+
+    hiddenStatusIconIdsCache = iconIds;
+    return hiddenStatusIconIdsCache;
+}
 
     private unsafe void ApplyPartyFilterToPartyList(AtkUnitBase* addon, bool debugThisRun)
     {
@@ -1871,8 +1879,8 @@ private unsafe bool TryReadIconIdFromImageNode(AtkImageNode* imageNode, out uint
         public string DefaultBehavior { get; set; } = string.Empty;
         public string Reason { get; set; } = string.Empty;
         public string Notes { get; set; } = string.Empty;
+        public List<uint> IconAliases { get; set; } = new();
     }
-
     public void ToggleConfigUi() => ConfigWindow.Toggle();
     public void ToggleMainUi() => MainWindow.Toggle();
 }

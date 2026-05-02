@@ -37,6 +37,17 @@
   },
 
   {
+    "Id": 110,
+    "Name": "Perfect Balance",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Monk personal form state. Useful to the Monk, not useful to other players.",
+    "Notes": "Always show if the local player has it. Party-list UI can use alternate icons.",
+    "IconAliases": [217565, 217566]
+  },
+
+
+  {
   "Id": 1181,
   "Name": "Riddle of Fire",
   "Category": "JobGaugeNoise",
@@ -99,14 +110,7 @@
   "Reason": "Job gauge / personal buff noise",
   "Notes": ""
 },
-{
-  "Id": 110,
-  "Name": "Perfect Balance",
-  "Category": "JobGaugeNoise",
-  "DefaultBehavior": "HideFromOthers",
-  "Reason": "Job gauge / personal buff noise",
-  "Notes": ""
-},
+
 {
   "Id": 3841,
   "Name": "Earth's Rumination",
