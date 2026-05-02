@@ -80,6 +80,7 @@
     "Reason": "Monk personal burst/status. Useful to the Monk, not useful to other players.",
     "Notes": "Always show if the local player has it."
   },
+  
   {
     "Id": 3842,
     "Name": "Wind's Rumination",
@@ -87,10 +88,8 @@
     "DefaultBehavior": "HideFromOthers",
     "Reason": "Monk personal follow-up/job-state status from Riddle of Wind. Useful to the Monk, not useful to other players.",
     "Notes": "Always show if the local player has it."
-  }
-  
+  },
 
-  ,
   {
     "Id": 3668,
     "Name": "Hunter's Instinct",
@@ -103,10 +102,43 @@
   {
   "Id": 2688,
   "Name": "Overheated",
-  "Category": "Machinist",
+  "Category": "JobGaugeNoise",
   "DefaultBehavior": "HideFromOthers",
   "Reason": "Personal Machinist burst state; not useful on other party members' status rows.",
   "Notes": "Always show if the local player has it."
+},
+
+{
+  "Id": 1179,
+  "Name": "Riddle of Earth",
+  "Category": "JobGaugeNoise",
+  "DefaultBehavior": "HideFromOthers",
+  "Reason": "Job gauge / personal buff noise",
+  "Notes": ""
+},
+{
+  "Id": 110,
+  "Name": "Perfect Balance",
+  "Category": "JobGaugeNoise",
+  "DefaultBehavior": "HideFromOthers",
+  "Reason": "Job gauge / personal buff noise",
+  "Notes": ""
+},
+{
+  "Id": 3841,
+  "Name": "Earth's Rumination",
+  "Category": "JobGaugeNoise",
+  "DefaultBehavior": "HideFromOthers",
+  "Reason": "Job gauge / personal buff noise",
+  "Notes": ""
+},
+{
+  "Id": 1180,
+  "Name": "Earth's Resolve",
+  "Category": "JobGaugeNoise",
+  "DefaultBehavior": "HideFromOthers",
+  "Reason": "Job gauge / personal buff noise",
+  "Notes": ""
 }
 
-  ]
+]
