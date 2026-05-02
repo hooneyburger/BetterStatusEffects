@@ -48,20 +48,15 @@ public sealed class Plugin : IDalamudPlugin
     private const ushort PartyStatusSlotWidth = 24;
     private const ushort PartyStatusSlotHeight = 41;
 
-    // These are common long-term UI/noise statuses that appear in IPartyMember.Statuses
-    // but usually should NOT be counted as party-list combat-status slots.
-    //
-    // Important:
-    // Hidden statuses still win. If one of these is in your JSON hide list, it will still be counted/hidden.
     private static readonly HashSet<uint> IgnoredPartyListNoiseStatusIds = new()
     {
-        48,   // Well Fed
-        360,  // Meat and Mead
-        361,  // That Which Binds Us
-        362,  // Proper Care
-        364,  // Reduced Rates
-        365,  // The Heat of Battle
-        1411, // Preferred World Bonus
+        48,
+        360,
+        361,
+        362,
+        364,
+        365,
+        1411,
     };
 
     private static readonly AddonEvent[] PartyListAddonEvents =
@@ -122,8 +117,6 @@ public sealed class Plugin : IDalamudPlugin
         foreach (var addonEvent in PartyListAddonEvents)
             AddonLifecycle.RegisterListener(addonEvent, PartyListAddonName, OnPartyListUpdateOrDraw);
 
-        Framework.Update += OnFrameworkUpdate;
-
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
@@ -138,8 +131,6 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
-
-        Framework.Update -= OnFrameworkUpdate;
 
         WindowSystem.RemoveAllWindows();
 
@@ -481,24 +472,24 @@ public sealed class Plugin : IDalamudPlugin
             lastPartyListStatusSignature = string.Empty;
         }
 
+        if (type != AddonEvent.PreDraw)
+            return;
+
         var shouldDebugThisRun = false;
 
-        if (type == AddonEvent.PreDraw)
+        if (debugOnceQueued)
         {
-            if (debugOnceQueued)
-            {
-                shouldDebugThisRun = true;
-                debugOnceQueued = false;
-            }
-            else if (debugEnabled)
-            {
-                debugPreDrawCounter++;
+            shouldDebugThisRun = true;
+            debugOnceQueued = false;
+        }
+        else if (debugEnabled)
+        {
+            debugPreDrawCounter++;
 
-                if (debugPreDrawCounter >= DebugEveryNPreDraws)
-                {
-                    debugPreDrawCounter = 0;
-                    shouldDebugThisRun = true;
-                }
+            if (debugPreDrawCounter >= DebugEveryNPreDraws)
+            {
+                debugPreDrawCounter = 0;
+                shouldDebugThisRun = true;
             }
         }
 
@@ -507,14 +498,6 @@ public sealed class Plugin : IDalamudPlugin
 
         if (shouldDebugThisRun)
             DumpPartyListDebug(addon);
-    }
-
-    private unsafe void OnFrameworkUpdate(IFramework framework)
-    {
-        if (!partyFilterEnabled)
-            return;
-
-        ApplyPartyFilterToLastAddon(false);
     }
 
     private unsafe void ApplyPartyFilterToLastAddon(bool debugThisRun)
@@ -653,22 +636,21 @@ public sealed class Plugin : IDalamudPlugin
             return;
 
         NormalizePartyStatusSlotGeometry(addon, debugThisRun);
-        RestoreHiddenPartyStatusNodesInAddon(addon);
 
         var hiddenStatusIds = LoadHiddenStatusIds();
         var hiddenIconIds = LoadHiddenStatusIconIds();
 
         if (debugThisRun)
         {
-            Log.Information($"[BSE] Party filter running. PartyList.Length = {PartyList.Length}, hidden IDs = {hiddenStatusIds.Count}, hidden icon IDs = {hiddenIconIds.Count}, BSE-hidden-node-count-after-restore = {hiddenPartyStatusNodeSnapshots.Count}");
+            Log.Information($"[BSE] Party filter running. PartyList.Length = {PartyList.Length}, hidden IDs = {hiddenStatusIds.Count}, hidden icon IDs = {hiddenIconIds.Count}, BSE-hidden-node-count = {hiddenPartyStatusNodeSnapshots.Count}");
         }
 
-        if (hiddenStatusIds.Count == 0)
+        if (hiddenIconIds.Count == 0)
         {
             lastPartyListStatusSignature = string.Empty;
 
             if (debugThisRun)
-                Log.Information("[BSE] No hidden status IDs loaded. Restored all BSE-hidden party node visibility.");
+                Log.Information("[BSE] No hidden status icon IDs loaded. Nothing to hide.");
 
             return;
         }
@@ -676,9 +658,9 @@ public sealed class Plugin : IDalamudPlugin
         if (PartyList.Length == 0)
         {
             if (debugThisRun)
-                Log.Information("[BSE] PartyList is empty. Applying solo fallback to row node id 10.");
+                Log.Information("[BSE] PartyList is empty. Applying solo UI-icon fallback to row node id 10.");
 
-            ApplySoloFilterToPartyList(addon, hiddenStatusIds, debugThisRun);
+            ApplySoloFilterToPartyList(addon, hiddenStatusIds, hiddenIconIds, debugThisRun);
             return;
         }
 
@@ -692,8 +674,8 @@ public sealed class Plugin : IDalamudPlugin
                 Log.Information($"[BSE] Party index {state.PartyIndex} name={state.PartyMemberName}");
                 Log.Information($"[BSE] Party index {state.PartyIndex} entityId={state.PartyMemberKey}");
                 Log.Information($"[BSE] Party index {state.PartyIndex} raw IPartyMember.Statuses: {FormatSlotMap(state.RawStatusIds)}");
-                Log.Information($"[BSE] Party index {state.PartyIndex} COMBAT-SAFE party-list slot order: {FormatRenderedSlotMap(state.PartyListSlotStatusIds)}");
-                Log.Information($"[BSE] Party index {state.PartyIndex} hidden combat-safe slots: {FormatSlotIndexes(state.HiddenSlotIndexes)}");
+                Log.Information($"[BSE] Party index {state.PartyIndex} DEBUG raw combat-safe guess only: {FormatRenderedSlotMap(state.PartyListSlotStatusIds)}");
+                Log.Information($"[BSE] Party index {state.PartyIndex} DEBUG raw guessed hidden slots only: {FormatSlotIndexes(state.HiddenSlotIndexes)}");
             }
 
             var rowNode = FindPartyRowNodeForMember(addon, state.PartyMemberName, state.PartyIndex, debugThisRun);
@@ -709,7 +691,11 @@ public sealed class Plugin : IDalamudPlugin
             if (debugThisRun)
                 Log.Information($"[BSE] Party index {state.PartyIndex} name={state.PartyMemberName}: matched UI row node id {rowNode->NodeId}.");
 
-            ApplyPartyListStatusCompact(rowNode, state.HiddenSlotIndexes, state.PartyListSlotStatusIds.Count);
+            ApplyPartyListStatusCompactByActualIcon(
+                rowNode,
+                hiddenIconIds,
+                debugThisRun,
+                $"partyIndex={state.PartyIndex} name={state.PartyMemberName}");
         }
     }
 
@@ -763,7 +749,7 @@ public sealed class Plugin : IDalamudPlugin
             return string.Empty;
 
         return string.Join("|", states.Select(state =>
-            $"{state.PartyIndex}:{state.PartyMemberKey}:raw={string.Join(",", state.RawStatusIds)}:combatSafePartySlots={string.Join(",", state.PartyListSlotStatusIds)}:hide={string.Join(",", state.HiddenSlotIndexes.OrderBy(slot => slot))}"));
+            $"{state.PartyIndex}:{state.PartyMemberKey}:raw={string.Join(",", state.RawStatusIds)}:debugRawCombatSafeGuess={string.Join(",", state.PartyListSlotStatusIds)}:debugRawHideGuess={string.Join(",", state.HiddenSlotIndexes.OrderBy(slot => slot))}"));
     }
 
     private List<uint> BuildCombatSafePartyListSlotStatusOrder(
@@ -780,36 +766,21 @@ public sealed class Plugin : IDalamudPlugin
             if (statusId == 0)
                 continue;
 
-            // Hidden statuses must be counted so their real slot can be hidden.
             if (hiddenStatusIds.Contains(statusId))
             {
                 result.Add(statusId);
                 continue;
             }
 
-            // Do not count common non-combat noise because these often appear in
-            // IPartyMember.Statuses before real party-list combat statuses.
             if (IgnoredPartyListNoiseStatusIds.Contains(statusId))
                 continue;
 
             if (TryGetPartyListPriority(statusId, out var partyListPriority))
             {
-                // Count normal party-list statuses.
-                if (partyListPriority > 0)
-                {
-                    result.Add(statusId);
-                    continue;
-                }
-
-                // CRITICAL FIX:
-                // Priority 0 does NOT mean "not rendered".
-                // Bloodbath and Arm's Length can appear here. If we skip them,
-                // every hidden status after them shifts left and BSE hides the wrong icon.
                 result.Add(statusId);
                 continue;
             }
 
-            // Conservative fallback: unknown non-noise statuses count as slots.
             result.Add(statusId);
         }
 
@@ -910,6 +881,7 @@ public sealed class Plugin : IDalamudPlugin
     private unsafe void ApplySoloFilterToPartyList(
         AtkUnitBase* addon,
         HashSet<uint> hiddenStatusIds,
+        HashSet<uint> hiddenIconIds,
         bool debugThisRun)
     {
         if (addon == null)
@@ -919,33 +891,33 @@ public sealed class Plugin : IDalamudPlugin
             .OfType<IBattleChara>()
             .FirstOrDefault(obj => obj.IsTargetable);
 
-        if (battleChara == null)
+        if (battleChara != null)
+        {
+            var rawStatusIds = GetBattleCharaVisibleStatusIds(battleChara);
+            var soloStatusSlotIds = rawStatusIds
+                .Take(MaxPartyStatusSlots)
+                .ToList();
+
+            var hiddenSoloSlotIndexes = BuildHiddenSlotIndexes(soloStatusSlotIds, hiddenStatusIds);
+
+            lastPartyListStatusSignature =
+                $"solo:{battleChara.GameObjectId}:raw={string.Join(",", rawStatusIds)}:debugSoloSlots={string.Join(",", soloStatusSlotIds)}:debugRawHideGuess={string.Join(",", hiddenSoloSlotIndexes.OrderBy(slot => slot))}";
+
+            if (debugThisRun)
+            {
+                Log.Information($"[BSE] Solo fallback name={battleChara.Name}");
+                Log.Information($"[BSE] Solo fallback raw status list: {FormatSlotMap(rawStatusIds)}");
+                Log.Information($"[BSE] Solo fallback DEBUG raw solo slot guess only: {FormatSlotMap(soloStatusSlotIds)}");
+                Log.Information($"[BSE] Solo fallback DEBUG raw hidden slots only: {FormatSlotIndexes(hiddenSoloSlotIndexes)}");
+                Log.Information("[BSE] Solo fallback expected row node id: 10");
+            }
+        }
+        else
         {
             if (debugThisRun)
-                Log.Information("[BSE] Solo fallback: could not find a battle character.");
+                Log.Information("[BSE] Solo fallback: could not find a battle character. Still applying UI-icon filter to row node id 10.");
 
             lastPartyListStatusSignature = string.Empty;
-            return;
-        }
-
-        var rawStatusIds = GetBattleCharaVisibleStatusIds(battleChara);
-
-        var soloStatusSlotIds = rawStatusIds
-            .Take(MaxPartyStatusSlots)
-            .ToList();
-
-        var hiddenSoloSlotIndexes = BuildHiddenSlotIndexes(soloStatusSlotIds, hiddenStatusIds);
-
-        lastPartyListStatusSignature =
-            $"solo:{battleChara.GameObjectId}:raw={string.Join(",", rawStatusIds)}:soloSlots={string.Join(",", soloStatusSlotIds)}:hide={string.Join(",", hiddenSoloSlotIndexes.OrderBy(slot => slot))}";
-
-        if (debugThisRun)
-        {
-            Log.Information($"[BSE] Solo fallback name={battleChara.Name}");
-            Log.Information($"[BSE] Solo fallback raw status list: {FormatSlotMap(rawStatusIds)}");
-            Log.Information($"[BSE] Solo fallback actual solo slot order used for hiding: {FormatSlotMap(soloStatusSlotIds)}");
-            Log.Information($"[BSE] Solo fallback hidden solo slots: {FormatSlotIndexes(hiddenSoloSlotIndexes)}");
-            Log.Information("[BSE] Solo fallback expected row node id: 10");
         }
 
         var rowNode = FindPartyRowNode(addon, 10);
@@ -958,7 +930,11 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        ApplyPartyListStatusCompact(rowNode, hiddenSoloSlotIndexes, soloStatusSlotIds.Count);
+        ApplyPartyListStatusCompactByActualIcon(
+            rowNode,
+            hiddenIconIds,
+            debugThisRun,
+            "solo rowNodeId=10");
     }
 
     private static List<uint> GetBattleCharaVisibleStatusIds(IBattleChara battleChara)
@@ -1117,10 +1093,11 @@ public sealed class Plugin : IDalamudPlugin
                (node->NodeId == 18 || IsPartyStatusCloneNode(node->NodeId));
     }
 
-    private unsafe void ApplyPartyListStatusCompact(
+    private unsafe void ApplyPartyListStatusCompactByActualIcon(
         AtkResNode* partyRowNode,
-        HashSet<int> hiddenSlotIndexes,
-        int renderedSlotCount)
+        HashSet<uint> hiddenIconIds,
+        bool debugThisRun,
+        string debugLabel)
     {
         if (partyRowNode == null)
             return;
@@ -1134,7 +1111,6 @@ public sealed class Plugin : IDalamudPlugin
         if (component == null)
             return;
 
-        var safeRenderedSlotCount = Math.Clamp(renderedSlotCount, 0, MaxPartyStatusSlots);
         var compactSlotIndex = 0;
 
         for (var slotIndex = 0; slotIndex < MaxPartyStatusSlots; slotIndex++)
@@ -1149,18 +1125,154 @@ public sealed class Plugin : IDalamudPlugin
             if (!IsPartyStatusIconNode(statusNode))
                 continue;
 
-            if (slotIndex >= safeRenderedSlotCount)
-                continue;
+            var hiddenByBse = IsPartyStatusSlotHiddenByBse(statusNode);
 
-            if (hiddenSlotIndexes.Contains(slotIndex))
+            if (!TryReadPartyStatusIconId(statusNode, out var actualIconId) || actualIconId == 0)
+            {
+                if (debugThisRun && (statusNode->IsVisible() || hiddenByBse))
+                {
+                    Log.Information($"[BSE] UI-icon compact {debugLabel}: slot={slotIndex} childIndex={childIndex} nodeId={statusNode->NodeId} visible={statusNode->IsVisible()} hiddenByBse={hiddenByBse} actualIconId=(none/read-failed) action=skip");
+                }
+
+                continue;
+            }
+
+            var shouldHide = hiddenIconIds.Contains(actualIconId);
+
+            if (debugThisRun)
+            {
+                Log.Information($"[BSE] UI-icon compact {debugLabel}: slot={slotIndex} childIndex={childIndex} nodeId={statusNode->NodeId} visible={statusNode->IsVisible()} hiddenByBse={hiddenByBse} actualIconId={actualIconId} hiddenByIcon={shouldHide}");
+            }
+
+            if (shouldHide)
             {
                 HidePartyStatusSlotVisibilityOnly(statusNode);
                 continue;
             }
 
+            RestorePartyStatusSlotIfBseHidIt(statusNode);
+
+            if (!statusNode->IsVisible())
+                continue;
+
             MovePartyStatusSlotToCompactPosition(statusNode, compactSlotIndex);
             compactSlotIndex++;
         }
+    }
+
+   private unsafe bool TryReadPartyStatusIconId(AtkResNode* statusNode, out uint iconId)
+{
+    iconId = 0;
+
+    if (statusNode == null)
+        return false;
+
+    if (statusNode->Type.ToString() != "1002")
+        return false;
+
+    try
+    {
+        var componentNode = (AtkComponentNode*)statusNode;
+        var component = componentNode->Component;
+
+        if (component == null)
+            return false;
+
+        var componentType = component->GetComponentType();
+
+        // Normal icon component, type 15.
+        // This is NOT what your party-list status slots currently are,
+        // but keep it as a safe fallback.
+        if (componentType == ComponentType.Icon)
+        {
+            var iconComponent = (AtkComponentIcon*)component;
+
+            if (iconComponent->IconId != 0 && iconComponent->IconId < 1_000_000)
+            {
+                iconId = iconComponent->IconId;
+                return true;
+            }
+        }
+
+        // Party-list status slots are type 16 / IconText.
+        // The real icon is on the inner image node's loaded texture resource.
+        var imageNode = component->GetImageNodeById(3);
+
+        if (imageNode == null)
+        {
+            for (var i = 0; i < component->UldManager.NodeListCount; i++)
+            {
+                var innerNode = component->UldManager.NodeList[i];
+
+                if (innerNode == null)
+                    continue;
+
+                if (innerNode->Type.ToString() != "Image")
+                    continue;
+
+                imageNode = (AtkImageNode*)innerNode;
+                break;
+            }
+        }
+
+        if (imageNode == null)
+            return false;
+
+        return TryReadIconIdFromImageNode(imageNode, out iconId);
+    }
+    catch
+    {
+        iconId = 0;
+        return false;
+    }
+}
+
+private unsafe bool TryReadIconIdFromImageNode(AtkImageNode* imageNode, out uint iconId)
+{
+    iconId = 0;
+
+    if (imageNode == null)
+        return false;
+
+    var partsList = imageNode->PartsList;
+
+    if (partsList == null)
+        return false;
+
+    if (imageNode->PartId >= partsList->PartCount)
+        return false;
+
+    var part = &partsList->Parts[imageNode->PartId];
+
+    if (part == null)
+        return false;
+
+    var asset = part->UldAsset;
+
+    if (asset == null)
+        return false;
+
+    var texture = &asset->AtkTexture;
+
+    if (texture->TextureType != TextureType.Resource)
+        return false;
+
+    var resource = texture->Resource;
+
+    if (resource == null)
+        return false;
+
+    iconId = resource->IconId;
+
+    return iconId != 0;
+}
+
+    private unsafe bool IsPartyStatusSlotHiddenByBse(AtkResNode* statusNode)
+    {
+        if (statusNode == null)
+            return false;
+
+        return hiddenPartyStatusNodeSnapshots.ContainsKey((nint)statusNode);
     }
 
     private unsafe void MovePartyStatusSlotToCompactPosition(
@@ -1231,8 +1343,6 @@ public sealed class Plugin : IDalamudPlugin
             node->Width == width &&
             node->Height == height)
             return;
-
-        CapturePartyStatusNodeSnapshotIfNeeded(node);
 
         node->SetPositionFloat(x, y);
         node->Width = width;
@@ -1320,6 +1430,7 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
+        NormalizePartyStatusSlotGeometry(addon, false);
         RestoreHiddenPartyStatusNodesInAddon(addon);
     }
 
@@ -1483,7 +1594,7 @@ public sealed class Plugin : IDalamudPlugin
 
         changedCount++;
     }
-    
+
     private unsafe void DumpPartyListDebug(AtkUnitBase* addon)
     {
         if (addon == null)
@@ -1505,7 +1616,7 @@ public sealed class Plugin : IDalamudPlugin
         Log.Information($"[BSE] Hidden status icon IDs loaded: {hiddenStatusIconIds.Count}");
         Log.Information($"[BSE] Hidden status IDs: {FormatStatusIds(hiddenStatusIds.OrderBy(id => id))}");
         Log.Information($"[BSE] Hidden icon IDs: {string.Join(", ", hiddenStatusIconIds.OrderBy(id => id))}");
-        Log.Information("[BSE] NOTE: hiding uses COMBAT-SAFE raw status order. It preserves priority-0 combat buffs like Bloodbath and Arm's Length so hidden statuses cannot shift over them. Compaction moves visible UI nodes left after hidden slots.");
+        Log.Information("[BSE] NOTE: actual party-list hiding now uses UI AtkComponentIcon.IconId, not guessed IPartyMember.Statuses slot indexes.");
 
         var partyCount = Math.Min(PartyList.Length, 8);
 
@@ -1533,8 +1644,8 @@ public sealed class Plugin : IDalamudPlugin
             Log.Information($"[BSE] Party index {partyIndex} name={partyMember.Name}");
             Log.Information($"[BSE] Party index {partyIndex} entityId={partyMember.EntityId}");
             Log.Information($"[BSE] Party index {partyIndex} raw IPartyMember.Statuses: {FormatSlotMap(rawStatusIds)}");
-            Log.Information($"[BSE] Party index {partyIndex} COMBAT-SAFE party-list slot order: {FormatRenderedSlotMap(combatSafePartyListStatusIds)}");
-            Log.Information($"[BSE] Party index {partyIndex} hidden combat-safe slots: {FormatSlotIndexes(hiddenSlotIndexes)}");
+            Log.Information($"[BSE] Party index {partyIndex} DEBUG raw combat-safe guess only: {FormatRenderedSlotMap(combatSafePartyListStatusIds)}");
+            Log.Information($"[BSE] Party index {partyIndex} DEBUG raw guessed hidden slots only: {FormatSlotIndexes(hiddenSlotIndexes)}");
             Log.Information($"[BSE] Party index {partyIndex} fallback row node id: {10 + partyIndex}");
             Log.Information($"[BSE] Party index {partyIndex} matched row node id: {(matchedRow == null ? "null" : matchedRow->NodeId.ToString())}");
         }
@@ -1578,6 +1689,8 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
+        var hiddenIconIds = LoadHiddenStatusIconIds();
+
         var componentNode = (AtkComponentNode*)partyRowNode;
         var component = componentNode->Component;
 
@@ -1614,8 +1727,17 @@ public sealed class Plugin : IDalamudPlugin
                 componentTypeText = "read-failed";
             }
 
+            var actualIconText = "read-failed";
+            var hiddenByActualIcon = false;
+
+            if (TryReadPartyStatusIconId(node, out var actualIconId))
+            {
+                actualIconText = actualIconId.ToString();
+                hiddenByActualIcon = hiddenIconIds.Contains(actualIconId);
+            }
+
             Log.Information(
-                $"[BSE] {label}: OUTER childIndex={childIndex} slotIndex={childIndex - FirstPartyStatusChildIndex} nodeId={node->NodeId} type={node->Type} visible={node->IsVisible()} hiddenByBse={hiddenPartyStatusNodeSnapshots.ContainsKey((nint)node)} componentType={componentTypeText} x={node->X} y={node->Y} w={node->Width} h={node->Height}"
+                $"[BSE] {label}: OUTER childIndex={childIndex} slotIndex={childIndex - FirstPartyStatusChildIndex} nodeId={node->NodeId} type={node->Type} visible={node->IsVisible()} hiddenByBse={hiddenPartyStatusNodeSnapshots.ContainsKey((nint)node)} componentType={componentTypeText} actualIconId={actualIconText} hiddenByActualIcon={hiddenByActualIcon} x={node->X} y={node->Y} w={node->Width} h={node->Height}"
             );
 
             var outerComponentNode = (AtkComponentNode*)node;
