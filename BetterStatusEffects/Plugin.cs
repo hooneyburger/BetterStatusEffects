@@ -31,14 +31,28 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IAddonLifecycle AddonLifecycle { get; private set; } = null!;
     [PluginService] internal static IPartyList PartyList { get; private set; } = null!;
     [PluginService] internal static IObjectTable ObjectTable { get; private set; } = null!;
+    [PluginService] internal static IFramework Framework { get; private set; } = null!;
 
     private const string CommandName = "/bse";
     private const int DebugEveryNPreDraws = 10;
+
+    private static readonly AddonEvent[] PartyListAddonEvents =
+    {
+        AddonEvent.PostSetup,
+        AddonEvent.PostShow,
+        AddonEvent.PostRequestedUpdate,
+        AddonEvent.PostRefresh,
+        AddonEvent.PostUpdate,
+        AddonEvent.PreDraw,
+    };
 
     private bool partyFilterEnabled = true;
     private bool debugEnabled;
     private bool debugOnceQueued;
     private int debugPreDrawCounter;
+
+    private nint lastPartyListAddonAddress;
+    private bool applyingPartyFilter;
 
     private List<StatusCategoryEntry>? statusCategoryEntriesCache;
     private HashSet<uint>? hiddenStatusIdsCache;
@@ -66,7 +80,10 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "Open Better Status Effects. Commands: /bse debug, /bse debug once, /bse debug on, /bse debug off, /bse partyfilter, /bse reload."
         });
 
-        AddonLifecycle.RegisterListener(AddonEvent.PreDraw, "_PartyList", OnPartyListUpdateOrDraw);
+        foreach (var addonEvent in PartyListAddonEvents)
+            AddonLifecycle.RegisterListener(addonEvent, "_PartyList", OnPartyListUpdateOrDraw);
+
+        Framework.Update += OnFrameworkUpdate;
 
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUi;
@@ -81,12 +98,16 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
 
+        Framework.Update -= OnFrameworkUpdate;
+        lastPartyListAddonAddress = nint.Zero;
+
         WindowSystem.RemoveAllWindows();
 
         ConfigWindow.Dispose();
         MainWindow.Dispose();
 
-        AddonLifecycle.UnregisterListener(AddonEvent.PreDraw, "_PartyList", OnPartyListUpdateOrDraw);
+        foreach (var addonEvent in PartyListAddonEvents)
+            AddonLifecycle.UnregisterListener(addonEvent, "_PartyList", OnPartyListUpdateOrDraw);
 
         CommandManager.RemoveHandler(CommandName);
     }
@@ -276,10 +297,10 @@ public sealed class Plugin : IDalamudPlugin
                 var categoryName = Path.GetFileNameWithoutExtension(file);
 
                 var hideFromOthersCount = entries.Count(entry =>
-                    entry.DefaultBehavior.Equals("HideFromOthers", StringComparison.OrdinalIgnoreCase));
+                    string.Equals(entry.DefaultBehavior, "HideFromOthers", StringComparison.OrdinalIgnoreCase));
 
                 var alwaysShowCount = entries.Count(entry =>
-                    entry.DefaultBehavior.Equals("AlwaysShow", StringComparison.OrdinalIgnoreCase));
+                    string.Equals(entry.DefaultBehavior, "AlwaysShow", StringComparison.OrdinalIgnoreCase));
 
                 totalStatuses += entries.Count;
                 totalHideFromOthers += hideFromOthersCount;
@@ -304,7 +325,7 @@ public sealed class Plugin : IDalamudPlugin
         var entries = LoadStatusCategoryEntries();
 
         var hiddenEntries = entries
-            .Where(entry => entry.DefaultBehavior.Equals("HideFromOthers", StringComparison.OrdinalIgnoreCase))
+            .Where(entry => string.Equals(entry.DefaultBehavior, "HideFromOthers", StringComparison.OrdinalIgnoreCase))
             .OrderBy(entry => entry.Category)
             .ThenBy(entry => entry.Id)
             .ToList();
@@ -334,12 +355,12 @@ public sealed class Plugin : IDalamudPlugin
         var entries = LoadStatusCategoryEntries();
 
         var hideEntriesById = entries
-            .Where(entry => entry.DefaultBehavior.Equals("HideFromOthers", StringComparison.OrdinalIgnoreCase))
+            .Where(entry => string.Equals(entry.DefaultBehavior, "HideFromOthers", StringComparison.OrdinalIgnoreCase))
             .GroupBy(entry => entry.Id)
             .ToDictionary(group => group.Key, group => group.First());
 
         var alwaysShowEntriesById = entries
-            .Where(entry => entry.DefaultBehavior.Equals("AlwaysShow", StringComparison.OrdinalIgnoreCase))
+            .Where(entry => string.Equals(entry.DefaultBehavior, "AlwaysShow", StringComparison.OrdinalIgnoreCase))
             .GroupBy(entry => entry.Id)
             .ToDictionary(group => group.Key, group => group.First());
 
@@ -392,6 +413,11 @@ public sealed class Plugin : IDalamudPlugin
         if (addon == null)
             return;
 
+        lastPartyListAddonAddress = args.Addon.Address;
+
+        if (applyingPartyFilter)
+            return;
+
         var shouldDebugThisRun = false;
 
         if (type == AddonEvent.PreDraw)
@@ -413,11 +439,59 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
-        if (partyFilterEnabled)
-            ApplyPartyFilterToPartyList(addon, shouldDebugThisRun);
+        try
+        {
+            applyingPartyFilter = true;
+
+            if (partyFilterEnabled)
+                ApplyPartyFilterToPartyList(addon, shouldDebugThisRun);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"[BSE] Party lifecycle filter pass failed: {ex}");
+        }
+        finally
+        {
+            applyingPartyFilter = false;
+        }
 
         if (shouldDebugThisRun)
             DumpPartyListDebug(addon);
+    }
+
+    private unsafe void OnFrameworkUpdate(IFramework framework)
+    {
+        if (!partyFilterEnabled)
+            return;
+
+        if (lastPartyListAddonAddress == nint.Zero)
+            return;
+
+        if (applyingPartyFilter)
+            return;
+
+        var addon = (AtkUnitBase*)lastPartyListAddonAddress;
+
+        if (addon == null)
+        {
+            lastPartyListAddonAddress = nint.Zero;
+            return;
+        }
+
+        try
+        {
+            applyingPartyFilter = true;
+            ApplyPartyFilterToPartyList(addon, false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"[BSE] Framework party filter pass failed: {ex}");
+            lastPartyListAddonAddress = nint.Zero;
+        }
+        finally
+        {
+            applyingPartyFilter = false;
+        }
     }
 
     private void ClearStatusCaches()
@@ -482,7 +556,7 @@ public sealed class Plugin : IDalamudPlugin
             return hiddenStatusIdsCache;
 
         hiddenStatusIdsCache = LoadStatusCategoryEntries()
-            .Where(entry => entry.DefaultBehavior.Equals("HideFromOthers", StringComparison.OrdinalIgnoreCase))
+            .Where(entry => string.Equals(entry.DefaultBehavior, "HideFromOthers", StringComparison.OrdinalIgnoreCase))
             .Select(entry => entry.Id)
             .ToHashSet();
 
@@ -497,13 +571,21 @@ public sealed class Plugin : IDalamudPlugin
         var hiddenStatusIds = LoadHiddenStatusIds();
 
         if (debugThisRun)
-            Log.Information($"[BSE] Party filter running. PartyList.Length={PartyList.Length}, hidden IDs={hiddenStatusIds.Count}");
+            Log.Information($"[BSE] Party filter running. Event batch. PartyList.Length = {PartyList.Length}, hidden IDs = {hiddenStatusIds.Count}");
 
         if (hiddenStatusIds.Count == 0)
+        {
+            if (debugThisRun)
+                Log.Information("[BSE] No hidden status IDs loaded.");
+
             return;
+        }
 
         if (PartyList.Length == 0)
         {
+            if (debugThisRun)
+                Log.Information("[BSE] PartyList is empty. Applying solo fallback to row node id 10.");
+
             ApplySoloFilterToPartyList(addon, hiddenStatusIds, debugThisRun);
             return;
         }
@@ -513,7 +595,12 @@ public sealed class Plugin : IDalamudPlugin
             var partyMember = PartyList[partyIndex];
 
             if (partyMember == null)
+            {
+                if (debugThisRun)
+                    Log.Information($"[BSE] Party index {partyIndex}: party member is null.");
+
                 continue;
+            }
 
             var visibleStatusIds = partyMember.Statuses
                 .Where(status => status.StatusId != 0)
@@ -526,15 +613,21 @@ public sealed class Plugin : IDalamudPlugin
             if (debugThisRun)
             {
                 Log.Information($"[BSE] Party index {partyIndex} name={partyMember.Name}");
-                Log.Information($"[BSE] Party index {partyIndex} raw status list: {FormatSlotMap(visibleStatusIds)}");
+                Log.Information($"[BSE] Party index {partyIndex} entityId={partyMember.EntityId}");
+                Log.Information($"[BSE] Party index {partyIndex} raw slot map: {FormatSlotMap(visibleStatusIds)}");
                 Log.Information($"[BSE] Party index {partyIndex} hidden slots: {string.Join(", ", hiddenSlotIndexes)}");
-                Log.Information($"[BSE] Party index {partyIndex} expected row node id: {10 + partyIndex}");
             }
 
-            var rowNode = FindPartyRowNode(addon, 10 + partyIndex);
+            var rowNodeId = 10 + partyIndex;
+            var rowNode = FindPartyRowNode(addon, rowNodeId);
 
             if (rowNode == null)
+            {
+                if (debugThisRun)
+                    Log.Information($"[BSE] Party index {partyIndex}: could not find row node id {rowNodeId}.");
+
                 continue;
+            }
 
             ApplyPartyListStatusVisibilityOnly(rowNode, hiddenSlotIndexes, visibleStatusIds.Count);
         }
@@ -568,7 +661,7 @@ public sealed class Plugin : IDalamudPlugin
         if (debugThisRun)
         {
             Log.Information($"[BSE] Solo fallback name={battleChara.Name}");
-            Log.Information($"[BSE] Solo fallback raw status list: {FormatSlotMap(visibleStatusIds)}");
+            Log.Information($"[BSE] Solo fallback raw slot map: {FormatSlotMap(visibleStatusIds)}");
             Log.Information($"[BSE] Solo fallback hidden slots: {string.Join(", ", hiddenSlotIndexes)}");
             Log.Information("[BSE] Solo fallback expected row node id: 10");
         }
@@ -576,7 +669,12 @@ public sealed class Plugin : IDalamudPlugin
         var rowNode = FindPartyRowNode(addon, 10);
 
         if (rowNode == null)
+        {
+            if (debugThisRun)
+                Log.Information("[BSE] Solo fallback: could not find row node id 10.");
+
             return;
+        }
 
         ApplyPartyListStatusVisibilityOnly(rowNode, hiddenSlotIndexes, visibleStatusIds.Count);
     }
@@ -623,39 +721,15 @@ public sealed class Plugin : IDalamudPlugin
         if (statusNode == null)
             return;
 
-        // Hide only the outer status slot.
-        // Do not hide inner image/text nodes, or recycled nodes can keep broken timers/icons.
         statusNode->ToggleVisibility(false);
     }
 
-    private unsafe void RestorePartyStatusSlot(AtkResNode* statusNode)
+    private unsafe void ShowPartyStatusSlot(AtkResNode* statusNode)
     {
         if (statusNode == null)
             return;
 
         statusNode->ToggleVisibility(true);
-
-        if (statusNode->Type.ToString() != "1002")
-            return;
-
-        var componentNode = (AtkComponentNode*)statusNode;
-        var component = componentNode->Component;
-
-        if (component == null)
-            return;
-
-        for (var i = 0; i < component->UldManager.NodeListCount; i++)
-        {
-            var child = component->UldManager.NodeList[i];
-
-            if (child == null)
-                continue;
-
-            // NodeId 4 is the extra overlay/bar from the debug logs.
-            // Leave nodeId 3 icon and nodeId 2 timer text alone.
-            if (child->NodeId == 4)
-                child->ToggleVisibility(false);
-        }
     }
 
     private unsafe void ApplyPartyListStatusVisibilityOnly(
@@ -664,6 +738,9 @@ public sealed class Plugin : IDalamudPlugin
         int visibleStatusCount)
     {
         if (partyRowNode == null)
+            return;
+
+        if (partyRowNode->Type.ToString() != "1006")
             return;
 
         var componentNode = (AtkComponentNode*)partyRowNode;
@@ -701,7 +778,7 @@ public sealed class Plugin : IDalamudPlugin
             if (shouldHide)
                 HidePartyStatusSlot(statusNode);
             else
-                RestorePartyStatusSlot(statusNode);
+                ShowPartyStatusSlot(statusNode);
         }
     }
 
@@ -729,7 +806,7 @@ public sealed class Plugin : IDalamudPlugin
 
             if (battleChara == null)
             {
-                Log.Information("[BSE] Debug solo raw status list: no targetable battle character found.");
+                Log.Information("[BSE] Debug solo slot map: no targetable battle character found.");
             }
             else
             {
@@ -798,6 +875,12 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (partyRowNode == null)
             return;
+
+        if (partyRowNode->Type.ToString() != "1006")
+        {
+            Log.Information($"[BSE] {label}: not a component row. type={partyRowNode->Type}");
+            return;
+        }
 
         var componentNode = (AtkComponentNode*)partyRowNode;
         var component = componentNode->Component;
