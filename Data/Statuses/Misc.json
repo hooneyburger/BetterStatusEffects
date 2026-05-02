@@ -1,0 +1,19 @@
+[
+  {
+    "Id": 1411,
+    "Name": "Preferred World Bonus",
+    "Category": "Misc",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Non-combat bonus status. Irrelevant when viewing other players.",
+    "Notes": "Hide from other players."
+  },
+
+  {
+    "Id": 1250,
+    "Name": "True North",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Personal positional-assist buff. It only matters to the player using it.",
+    "Notes": "Always show if the local player has it."
+  }
+]

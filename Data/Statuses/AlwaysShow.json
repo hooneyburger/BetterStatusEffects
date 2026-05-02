@@ -1,0 +1,10 @@
+[
+  {
+    "Id": 1185,
+    "Name": "Brotherhood",
+    "Category": "AlwaysShow",
+    "DefaultBehavior": "AlwaysShow",
+    "Reason": "Party raid buff. Important group combat information.",
+    "Notes": "Do not hide by default."
+  }
+]

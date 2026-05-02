@@ -7,10 +7,26 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
+  <PropertyGroup>
+  <Version>0.0.0.1</Version>
+  <PackageProjectUrl>https://github.com/hooneyburger/BetterStatusEffects</PackageProjectUrl>
+  <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
+  <IsPackable>false</IsPackable>
+  <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
   <ItemGroup>
     <Content Include="..\Data\goat.png">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\Data\Statuses\*.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>Data\Statuses\%(Filename)%(Extension)</TargetPath>
+      <Visible>true</Visible>
     </Content>
   </ItemGroup>
 </Project>

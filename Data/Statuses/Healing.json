@@ -1,0 +1,9 @@
+[
+  {
+    "Id": 0,
+    "Name": "Example Healing Status",
+    "Category": "Healing",
+    "Reason": "Regens, healing buffs, healing-over-time effects, barriers, and recovery-related statuses.",
+    "Notes": "Placeholder."
+  }
+]

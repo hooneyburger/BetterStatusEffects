@@ -1,0 +1,9 @@
+[
+  {
+    "Id": 0,
+    "Name": "Example Mitigation",
+    "Category": "Mitigation",
+    "Reason": "Defensive cooldowns, damage reduction, shields, invulnerability, and tank cooldowns.",
+    "Notes": "Placeholder."
+  }
+]

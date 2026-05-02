@@ -1,0 +1,112 @@
+[
+  {
+    "Id": 1182,
+    "Name": "Meditative Brotherhood",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Monk-specific personal chakra/resource status from Brotherhood. Useful to the Monk, not useful to other players.",
+    "Notes": "Always show if the local player has it."
+  },
+
+  {
+    "Id": 1185,
+    "Name": "Meditative Brotherhood",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Monk-specific personal chakra/resource status from Brotherhood. Useful to the Monk, not useful to other players.",
+    "Notes": "Always show if the local player has it."
+  },
+
+  {
+  "Id": 108,
+  "Name": "Raptor Form",
+  "Category": "JobGaugeNoise",
+  "DefaultBehavior": "HideFromOthers",
+  "Reason": "Personal Monk form state; noisy on party status rows.",
+  "Notes": "Seen in solo debug as the only visible slot after other Monk statuses were hidden."
+  },
+
+  {
+    "Id": 2513,
+    "Name": "Formless Fist",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Monk personal form/rotation state. Useful to the Monk, not useful to other players.",
+    "Notes": "Always show if the local player has it."
+  },
+  
+  {
+    "Id": 109,
+    "Name": "Coeurl Form",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Monk personal form state. Useful to the Monk, not useful to other players.",
+    "Notes": "Always show if the local player has it."
+  },
+
+  {
+    "Id": 107,
+    "Name": "Opo-opo Form",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Monk personal form state. Useful to the Monk, not useful to other players.",
+    "Notes": "Always show if the local player has it."
+  },
+
+  {
+  "Id": 1181,
+  "Name": "Riddle of Fire",
+  "Category": "JobGaugeNoise",
+  "DefaultBehavior": "HideFromOthers",
+  "Reason": "Monk personal damage burst/status. Useful to the Monk, not useful to other players.",
+  "Notes": "Always show if the local player has it."
+  },
+
+  {
+    "Id": 3843,
+    "Name": "Fire's Rumination",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Monk personal follow-up/job-state status from Riddle of Fire. Useful to the Monk, not useful to other players.",
+    "Notes": "Always show if the local player has it."
+  }
+
+  ,
+  {
+    "Id": 2687,
+    "Name": "Riddle of Wind",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Monk personal burst/status. Useful to the Monk, not useful to other players.",
+    "Notes": "Always show if the local player has it."
+  },
+  {
+    "Id": 3842,
+    "Name": "Wind's Rumination",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Monk personal follow-up/job-state status from Riddle of Wind. Useful to the Monk, not useful to other players.",
+    "Notes": "Always show if the local player has it."
+  }
+  
+
+  ,
+  {
+    "Id": 3668,
+    "Name": "Hunter's Instinct",
+    "Category": "JobGaugeNoise",
+    "DefaultBehavior": "HideFromOthers",
+    "Reason": "Viper personal job-state/burst status. Useful to the Viper, not useful to other players.",
+    "Notes": "Always show if the local player has it."
+  },
+
+  {
+  "Id": 2688,
+  "Name": "Overheated",
+  "Category": "Machinist",
+  "DefaultBehavior": "HideFromOthers",
+  "Reason": "Personal Machinist burst state; not useful on other party members' status rows.",
+  "Notes": "Always show if the local player has it."
+}
+
+  ]

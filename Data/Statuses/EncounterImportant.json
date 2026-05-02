@@ -1,0 +1,9 @@
+[
+  {
+    "Id": 0,
+    "Name": "Example Encounter Important Status",
+    "Category": "EncounterImportant",
+    "Reason": "Fight-specific statuses, mechanic markers, debuffs, duties, prey markers, doom-like effects, and required mechanic information.",
+    "Notes": "Appears by default."
+  }
+]

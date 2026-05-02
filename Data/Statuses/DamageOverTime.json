@@ -1,0 +1,9 @@
+[
+  {
+    "Id": 0,
+    "Name": "Example Damage Over Time",
+    "Category": "DamageOverTime",
+    "Reason": "Damage-over-time effects, bleeds, poisons, burns, and ticking damage.",
+    "Notes": "Not automatically hidden by default."
+  }
+]
