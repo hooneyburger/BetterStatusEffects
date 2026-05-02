@@ -1,0 +1,15 @@
+{
+  "Author": "honeyburger",
+  "Name": "Better Status Effects",
+  "Punchline": "Filters irrelevant status effects from other players.",
+  "Description": "Hides useless or irrelevant status effects from other players to reduce status-effect clutter. Use /bse to open the config window.",
+  "InternalName": "BetterStatusEffects",
+  "ApplicableVersion": "any",
+  "Tags": [
+    "status",
+    "effects",
+    "buffs",
+    "debuffs",
+    "ui"
+  ]
+}
