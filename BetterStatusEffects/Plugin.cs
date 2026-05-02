@@ -13,6 +13,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text.Json;
 
 namespace BetterStatusEffects;
@@ -34,7 +35,34 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IFramework Framework { get; private set; } = null!;
 
     private const string CommandName = "/bse";
+    private const string PartyListAddonName = "_PartyList";
+
     private const int DebugEveryNPreDraws = 10;
+
+    private const int FirstPartyStatusChildIndex = 5;
+    private const int MaxPartyStatusSlots = 10;
+
+    private const short PartyStatusSlotBaseX = 263;
+    private const short PartyStatusSlotSpacingX = 24;
+    private const short PartyStatusSlotY = 12;
+    private const ushort PartyStatusSlotWidth = 24;
+    private const ushort PartyStatusSlotHeight = 41;
+
+    // These are common long-term UI/noise statuses that appear in IPartyMember.Statuses
+    // but usually should NOT be counted as party-list combat-status slots.
+    //
+    // Important:
+    // Hidden statuses still win. If one of these is in your JSON hide list, it will still be counted/hidden.
+    private static readonly HashSet<uint> IgnoredPartyListNoiseStatusIds = new()
+    {
+        48,   // Well Fed
+        360,  // Meat and Mead
+        361,  // That Which Binds Us
+        362,  // Proper Care
+        364,  // Reduced Rates
+        365,  // The Heat of Battle
+        1411, // Preferred World Bonus
+    };
 
     private static readonly AddonEvent[] PartyListAddonEvents =
     {
@@ -54,8 +82,16 @@ public sealed class Plugin : IDalamudPlugin
     private nint lastPartyListAddonAddress;
     private bool applyingPartyFilter;
 
+    private readonly Dictionary<nint, PartyStatusNodeSnapshot> hiddenPartyStatusNodeSnapshots = new();
+
+    private string lastPartyListStatusSignature = string.Empty;
+
     private List<StatusCategoryEntry>? statusCategoryEntriesCache;
     private HashSet<uint>? hiddenStatusIdsCache;
+    private HashSet<uint>? hiddenStatusIconIdsCache;
+
+    private static bool partyListPriorityReflectionResolved;
+    private static MemberInfo? partyListPriorityMember;
 
     public Configuration Configuration { get; init; }
 
@@ -67,7 +103,10 @@ public sealed class Plugin : IDalamudPlugin
     {
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
-        var goatImagePath = Path.Combine(PluginInterface.AssemblyLocation.Directory?.FullName!, "goat.png");
+        var pluginDirectory = PluginInterface.AssemblyLocation.Directory?.FullName
+            ?? PluginInterface.ConfigDirectory.FullName;
+
+        var goatImagePath = Path.Combine(pluginDirectory, "goat.png");
 
         ConfigWindow = new ConfigWindow(this);
         MainWindow = new MainWindow(this, goatImagePath);
@@ -77,11 +116,11 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open Better Status Effects. Commands: /bse debug, /bse debug once, /bse debug on, /bse debug off, /bse partyfilter, /bse reload."
+            HelpMessage = "Open Better Status Effects. Commands: /bse target, /bse categories, /bse hidden, /bse checktarget, /bse debug, /bse debug once, /bse debug on, /bse debug off, /bse partyfilter, /bse reload."
         });
 
         foreach (var addonEvent in PartyListAddonEvents)
-            AddonLifecycle.RegisterListener(addonEvent, "_PartyList", OnPartyListUpdateOrDraw);
+            AddonLifecycle.RegisterListener(addonEvent, PartyListAddonName, OnPartyListUpdateOrDraw);
 
         Framework.Update += OnFrameworkUpdate;
 
@@ -94,12 +133,13 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        RestoreHiddenPartyStatusNodesFromLastAddon();
+
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
 
         Framework.Update -= OnFrameworkUpdate;
-        lastPartyListAddonAddress = nint.Zero;
 
         WindowSystem.RemoveAllWindows();
 
@@ -107,9 +147,13 @@ public sealed class Plugin : IDalamudPlugin
         MainWindow.Dispose();
 
         foreach (var addonEvent in PartyListAddonEvents)
-            AddonLifecycle.UnregisterListener(addonEvent, "_PartyList", OnPartyListUpdateOrDraw);
+            AddonLifecycle.UnregisterListener(addonEvent, PartyListAddonName, OnPartyListUpdateOrDraw);
 
         CommandManager.RemoveHandler(CommandName);
+
+        lastPartyListAddonAddress = nint.Zero;
+        hiddenPartyStatusNodeSnapshots.Clear();
+        lastPartyListStatusSignature = string.Empty;
     }
 
     private void OnCommand(string command, string args)
@@ -143,15 +187,32 @@ public sealed class Plugin : IDalamudPlugin
         if (args.Equals("reload", StringComparison.OrdinalIgnoreCase))
         {
             ClearStatusCaches();
+            lastPartyListStatusSignature = string.Empty;
+
             var hiddenStatusIds = LoadHiddenStatusIds();
-            ChatGui.Print($"[BSE] Reloaded status data. Hidden status IDs: {hiddenStatusIds.Count}");
+            var hiddenStatusIconIds = LoadHiddenStatusIconIds();
+
+            ChatGui.Print($"[BSE] Reloaded status data. Hidden status IDs: {hiddenStatusIds.Count}. Hidden icon IDs: {hiddenStatusIconIds.Count}.");
             return;
         }
 
         if (args.Equals("partyfilter", StringComparison.OrdinalIgnoreCase))
         {
-            partyFilterEnabled = !partyFilterEnabled;
-            ChatGui.Print($"[BSE] Party filter: {(partyFilterEnabled ? "ON" : "OFF")}");
+            if (partyFilterEnabled)
+            {
+                partyFilterEnabled = false;
+                RestoreHiddenPartyStatusNodesFromLastAddon();
+                lastPartyListStatusSignature = string.Empty;
+                ChatGui.Print("[BSE] Party filter: OFF");
+            }
+            else
+            {
+                partyFilterEnabled = true;
+                lastPartyListStatusSignature = string.Empty;
+                ChatGui.Print("[BSE] Party filter: ON");
+                ApplyPartyFilterToLastAddon(false);
+            }
+
             return;
         }
 
@@ -237,8 +298,12 @@ public sealed class Plugin : IDalamudPlugin
 
             foundAny = true;
 
+            var priorityText = TryGetPartyListPriority(status.StatusId, out var priority)
+                ? priority.ToString()
+                : "unknown";
+
             ChatGui.Print(
-                $"[BSE] ID {status.StatusId} | {FormatStatusId(status.StatusId)} | Param {status.Param} | Time {status.RemainingTime:0.0}s | Source {status.SourceId}"
+                $"[BSE] ID {status.StatusId} | {FormatStatusId(status.StatusId)} | Icon {GetStatusIconId(status.StatusId)} | PartyListPriority {priorityText} | Param {status.Param} | Time {status.RemainingTime:0.0}s | Source {status.SourceId}"
             );
         }
 
@@ -339,7 +404,13 @@ public sealed class Plugin : IDalamudPlugin
         ChatGui.Print($"[BSE] HideFromOthers statuses: {hiddenEntries.Count}");
 
         foreach (var entry in hiddenEntries)
-            ChatGui.Print($"[BSE] {entry.Id} | {entry.Name} | {entry.Category}");
+        {
+            var priorityText = TryGetPartyListPriority(entry.Id, out var priority)
+                ? priority.ToString()
+                : "unknown";
+
+            ChatGui.Print($"[BSE] {entry.Id} | {entry.Name} | Icon {GetStatusIconId(entry.Id)} | PartyListPriority {priorityText} | {entry.Category}");
+        }
     }
 
     private void CheckTargetStatuses()
@@ -352,17 +423,7 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        var entries = LoadStatusCategoryEntries();
-
-        var hideEntriesById = entries
-            .Where(entry => string.Equals(entry.DefaultBehavior, "HideFromOthers", StringComparison.OrdinalIgnoreCase))
-            .GroupBy(entry => entry.Id)
-            .ToDictionary(group => group.Key, group => group.First());
-
-        var alwaysShowEntriesById = entries
-            .Where(entry => string.Equals(entry.DefaultBehavior, "AlwaysShow", StringComparison.OrdinalIgnoreCase))
-            .GroupBy(entry => entry.Id)
-            .ToDictionary(group => group.Key, group => group.First());
+        var hiddenStatusIds = LoadHiddenStatusIds();
 
         ChatGui.Print($"[BSE] Checking statuses on {target.Name}:");
 
@@ -378,23 +439,22 @@ public sealed class Plugin : IDalamudPlugin
             foundAny = true;
 
             var statusName = GetStatusName(status.StatusId);
+            var iconId = GetStatusIconId(status.StatusId);
+            var hiddenByStatusId = hiddenStatusIds.Contains(status.StatusId);
 
-            if (alwaysShowEntriesById.TryGetValue(status.StatusId, out var alwaysShowEntry))
-            {
-                showCount++;
-                ChatGui.Print($"[BSE] SHOW | {status.StatusId} | {statusName} | {alwaysShowEntry.Category}");
-                continue;
-            }
+            var priorityText = TryGetPartyListPriority(status.StatusId, out var priority)
+                ? priority.ToString()
+                : "unknown";
 
-            if (hideEntriesById.TryGetValue(status.StatusId, out var hideEntry))
+            if (hiddenByStatusId)
             {
                 hideCount++;
-                ChatGui.Print($"[BSE] HIDE | {status.StatusId} | {statusName} | {hideEntry.Category}");
+                ChatGui.Print($"[BSE] HIDE | {status.StatusId} | {statusName} | Icon {iconId} | PartyListPriority {priorityText}");
                 continue;
             }
 
             showCount++;
-            ChatGui.Print($"[BSE] SHOW | {status.StatusId} | {statusName} | Unlisted");
+            ChatGui.Print($"[BSE] SHOW | {status.StatusId} | {statusName} | Icon {iconId} | PartyListPriority {priorityText}");
         }
 
         if (!foundAny)
@@ -408,15 +468,18 @@ public sealed class Plugin : IDalamudPlugin
 
     private unsafe void OnPartyListUpdateOrDraw(AddonEvent type, AddonArgs args)
     {
-        var addon = (AtkUnitBase*)args.Addon.Address;
+        var addonAddress = args.Addon.Address;
+        var addon = (AtkUnitBase*)addonAddress;
 
         if (addon == null)
             return;
 
-        lastPartyListAddonAddress = args.Addon.Address;
-
-        if (applyingPartyFilter)
-            return;
+        if (lastPartyListAddonAddress != addonAddress)
+        {
+            lastPartyListAddonAddress = addonAddress;
+            hiddenPartyStatusNodeSnapshots.Clear();
+            lastPartyListStatusSignature = string.Empty;
+        }
 
         var shouldDebugThisRun = false;
 
@@ -439,21 +502,8 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
-        try
-        {
-            applyingPartyFilter = true;
-
-            if (partyFilterEnabled)
-                ApplyPartyFilterToPartyList(addon, shouldDebugThisRun);
-        }
-        catch (Exception ex)
-        {
-            Log.Warning($"[BSE] Party lifecycle filter pass failed: {ex}");
-        }
-        finally
-        {
-            applyingPartyFilter = false;
-        }
+        if (partyFilterEnabled)
+            ApplyPartyFilterToAddonWithGuard(addon, shouldDebugThisRun);
 
         if (shouldDebugThisRun)
             DumpPartyListDebug(addon);
@@ -464,29 +514,39 @@ public sealed class Plugin : IDalamudPlugin
         if (!partyFilterEnabled)
             return;
 
-        if (lastPartyListAddonAddress == nint.Zero)
-            return;
+        ApplyPartyFilterToLastAddon(false);
+    }
 
-        if (applyingPartyFilter)
+    private unsafe void ApplyPartyFilterToLastAddon(bool debugThisRun)
+    {
+        if (lastPartyListAddonAddress == nint.Zero)
             return;
 
         var addon = (AtkUnitBase*)lastPartyListAddonAddress;
 
         if (addon == null)
-        {
-            lastPartyListAddonAddress = nint.Zero;
             return;
-        }
+
+        ApplyPartyFilterToAddonWithGuard(addon, debugThisRun);
+    }
+
+    private unsafe void ApplyPartyFilterToAddonWithGuard(AtkUnitBase* addon, bool debugThisRun)
+    {
+        if (addon == null)
+            return;
+
+        if (applyingPartyFilter)
+            return;
+
+        applyingPartyFilter = true;
 
         try
         {
-            applyingPartyFilter = true;
-            ApplyPartyFilterToPartyList(addon, false);
+            ApplyPartyFilterToPartyList(addon, debugThisRun);
         }
         catch (Exception ex)
         {
-            Log.Warning($"[BSE] Framework party filter pass failed: {ex}");
-            lastPartyListAddonAddress = nint.Zero;
+            Log.Error($"[BSE] Party filter failed: {ex}");
         }
         finally
         {
@@ -498,6 +558,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         statusCategoryEntriesCache = null;
         hiddenStatusIdsCache = null;
+        hiddenStatusIconIdsCache = null;
     }
 
     private List<StatusCategoryEntry> LoadStatusCategoryEntries()
@@ -563,20 +624,51 @@ public sealed class Plugin : IDalamudPlugin
         return hiddenStatusIdsCache;
     }
 
+    private HashSet<uint> LoadHiddenStatusIconIds()
+    {
+        if (hiddenStatusIconIdsCache != null)
+            return hiddenStatusIconIdsCache;
+
+        var hiddenStatusIds = LoadHiddenStatusIds();
+        var statusSheet = DataManager.GetExcelSheet<Status>();
+
+        var iconIds = new HashSet<uint>();
+
+        foreach (var statusId in hiddenStatusIds)
+        {
+            if (!statusSheet.TryGetRow(statusId, out var statusRow))
+                continue;
+
+            if (statusRow.Icon != 0)
+                iconIds.Add(statusRow.Icon);
+        }
+
+        hiddenStatusIconIdsCache = iconIds;
+        return hiddenStatusIconIdsCache;
+    }
+
     private unsafe void ApplyPartyFilterToPartyList(AtkUnitBase* addon, bool debugThisRun)
     {
         if (addon == null)
             return;
 
+        NormalizePartyStatusSlotGeometry(addon, debugThisRun);
+        RestoreHiddenPartyStatusNodesInAddon(addon);
+
         var hiddenStatusIds = LoadHiddenStatusIds();
+        var hiddenIconIds = LoadHiddenStatusIconIds();
 
         if (debugThisRun)
-            Log.Information($"[BSE] Party filter running. Event batch. PartyList.Length = {PartyList.Length}, hidden IDs = {hiddenStatusIds.Count}");
+        {
+            Log.Information($"[BSE] Party filter running. PartyList.Length = {PartyList.Length}, hidden IDs = {hiddenStatusIds.Count}, hidden icon IDs = {hiddenIconIds.Count}, BSE-hidden-node-count-after-restore = {hiddenPartyStatusNodeSnapshots.Count}");
+        }
 
         if (hiddenStatusIds.Count == 0)
         {
+            lastPartyListStatusSignature = string.Empty;
+
             if (debugThisRun)
-                Log.Information("[BSE] No hidden status IDs loaded.");
+                Log.Information("[BSE] No hidden status IDs loaded. Restored all BSE-hidden party node visibility.");
 
             return;
         }
@@ -590,7 +682,45 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        for (var partyIndex = 0; partyIndex < PartyList.Length; partyIndex++)
+        var renderStates = BuildPartyMemberRenderStates(hiddenStatusIds, debugThisRun);
+        lastPartyListStatusSignature = BuildCombinedStatusSignature(renderStates);
+
+        foreach (var state in renderStates)
+        {
+            if (debugThisRun)
+            {
+                Log.Information($"[BSE] Party index {state.PartyIndex} name={state.PartyMemberName}");
+                Log.Information($"[BSE] Party index {state.PartyIndex} entityId={state.PartyMemberKey}");
+                Log.Information($"[BSE] Party index {state.PartyIndex} raw IPartyMember.Statuses: {FormatSlotMap(state.RawStatusIds)}");
+                Log.Information($"[BSE] Party index {state.PartyIndex} COMBAT-SAFE party-list slot order: {FormatRenderedSlotMap(state.PartyListSlotStatusIds)}");
+                Log.Information($"[BSE] Party index {state.PartyIndex} hidden combat-safe slots: {FormatSlotIndexes(state.HiddenSlotIndexes)}");
+            }
+
+            var rowNode = FindPartyRowNodeForMember(addon, state.PartyMemberName, state.PartyIndex, debugThisRun);
+
+            if (rowNode == null)
+            {
+                if (debugThisRun)
+                    Log.Information($"[BSE] Party index {state.PartyIndex} name={state.PartyMemberName}: could not find matching party row.");
+
+                continue;
+            }
+
+            if (debugThisRun)
+                Log.Information($"[BSE] Party index {state.PartyIndex} name={state.PartyMemberName}: matched UI row node id {rowNode->NodeId}.");
+
+            ApplyPartyListStatusVisibilityOnly(rowNode, state.HiddenSlotIndexes);
+        }
+    }
+
+    private List<PartyMemberRenderState> BuildPartyMemberRenderStates(
+        HashSet<uint> hiddenStatusIds,
+        bool debugThisRun)
+    {
+        var states = new List<PartyMemberRenderState>();
+        var partyCount = Math.Min(PartyList.Length, 8);
+
+        for (var partyIndex = 0; partyIndex < partyCount; partyIndex++)
         {
             var partyMember = PartyList[partyIndex];
 
@@ -602,38 +732,185 @@ public sealed class Plugin : IDalamudPlugin
                 continue;
             }
 
-            var visibleStatusIds = partyMember.Statuses
+            var partyMemberName = partyMember.Name.ToString();
+            var partyMemberKey = partyMember.EntityId.ToString();
+
+            var rawStatusIds = partyMember.Statuses
                 .Where(status => status.StatusId != 0)
                 .Select(status => status.StatusId)
-                .Take(10)
                 .ToList();
 
-            var hiddenSlotIndexes = BuildHiddenSlotIndexes(visibleStatusIds, hiddenStatusIds);
+            var partyListSlotStatusIds = BuildCombatSafePartyListSlotStatusOrder(rawStatusIds, hiddenStatusIds);
+            var hiddenSlotIndexes = BuildHiddenSlotIndexes(partyListSlotStatusIds, hiddenStatusIds);
 
-            if (debugThisRun)
+            states.Add(new PartyMemberRenderState
             {
-                Log.Information($"[BSE] Party index {partyIndex} name={partyMember.Name}");
-                Log.Information($"[BSE] Party index {partyIndex} entityId={partyMember.EntityId}");
-                Log.Information($"[BSE] Party index {partyIndex} raw slot map: {FormatSlotMap(visibleStatusIds)}");
-                Log.Information($"[BSE] Party index {partyIndex} hidden slots: {string.Join(", ", hiddenSlotIndexes)}");
-            }
+                PartyIndex = partyIndex,
+                PartyMemberName = partyMemberName,
+                PartyMemberKey = partyMemberKey,
+                RawStatusIds = rawStatusIds,
+                PartyListSlotStatusIds = partyListSlotStatusIds,
+                HiddenSlotIndexes = hiddenSlotIndexes,
+            });
+        }
 
-            var rowNodeId = 10 + partyIndex;
-            var rowNode = FindPartyRowNode(addon, rowNodeId);
+        return states;
+    }
 
-            if (rowNode == null)
+    private string BuildCombinedStatusSignature(List<PartyMemberRenderState> states)
+    {
+        if (states.Count == 0)
+            return string.Empty;
+
+        return string.Join("|", states.Select(state =>
+            $"{state.PartyIndex}:{state.PartyMemberKey}:raw={string.Join(",", state.RawStatusIds)}:combatSafePartySlots={string.Join(",", state.PartyListSlotStatusIds)}:hide={string.Join(",", state.HiddenSlotIndexes.OrderBy(slot => slot))}"));
+    }
+
+    private List<uint> BuildCombatSafePartyListSlotStatusOrder(
+        IReadOnlyList<uint> rawStatusIds,
+        HashSet<uint> hiddenStatusIds)
+    {
+        if (rawStatusIds.Count == 0)
+            return new List<uint>();
+
+        var result = new List<uint>();
+
+        foreach (var statusId in rawStatusIds)
+        {
+            if (statusId == 0)
+                continue;
+
+            // Hidden statuses must be counted so their real slot can be hidden.
+            if (hiddenStatusIds.Contains(statusId))
             {
-                if (debugThisRun)
-                    Log.Information($"[BSE] Party index {partyIndex}: could not find row node id {rowNodeId}.");
-
+                result.Add(statusId);
                 continue;
             }
 
-            ApplyPartyListStatusVisibilityOnly(rowNode, hiddenSlotIndexes, visibleStatusIds.Count);
+            // Do not count common non-combat noise because these often appear in
+            // IPartyMember.Statuses before real party-list combat statuses.
+            if (IgnoredPartyListNoiseStatusIds.Contains(statusId))
+                continue;
+
+            if (TryGetPartyListPriority(statusId, out var partyListPriority))
+            {
+                // Count normal party-list statuses.
+                if (partyListPriority > 0)
+                {
+                    result.Add(statusId);
+                    continue;
+                }
+
+                // CRITICAL FIX:
+                // Priority 0 does NOT mean "not rendered".
+                // Bloodbath and Arm's Length can appear here. If we skip them,
+                // every hidden status after them shifts left and BSE hides the wrong icon.
+                result.Add(statusId);
+                continue;
+            }
+
+            // Conservative fallback: unknown non-noise statuses count as slots.
+            result.Add(statusId);
+        }
+
+        return result
+            .Take(MaxPartyStatusSlots)
+            .ToList();
+    }
+
+    private HashSet<int> BuildHiddenSlotIndexes(
+        IReadOnlyList<uint> slotStatusIds,
+        HashSet<uint> hiddenStatusIds)
+    {
+        var hiddenSlotIndexes = new HashSet<int>();
+
+        for (var slotIndex = 0; slotIndex < slotStatusIds.Count && slotIndex < MaxPartyStatusSlots; slotIndex++)
+        {
+            if (hiddenStatusIds.Contains(slotStatusIds[slotIndex]))
+                hiddenSlotIndexes.Add(slotIndex);
+        }
+
+        return hiddenSlotIndexes;
+    }
+
+    private bool TryGetPartyListPriority(uint statusId, out uint priority)
+    {
+        priority = 0;
+
+        var statusSheet = DataManager.GetExcelSheet<Status>();
+
+        if (!statusSheet.TryGetRow(statusId, out var statusRow))
+            return false;
+
+        ResolvePartyListPriorityReflection();
+
+        if (partyListPriorityMember == null)
+            return false;
+
+        try
+        {
+            object? value = partyListPriorityMember switch
+            {
+                PropertyInfo propertyInfo => propertyInfo.GetValue(statusRow),
+                FieldInfo fieldInfo => fieldInfo.GetValue(statusRow),
+                _ => null,
+            };
+
+            if (value == null)
+                return false;
+
+            priority = Convert.ToUInt32(value);
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
-    private unsafe void ApplySoloFilterToPartyList(AtkUnitBase* addon, HashSet<uint> hiddenStatusIds, bool debugThisRun)
+    private static void ResolvePartyListPriorityReflection()
+    {
+        if (partyListPriorityReflectionResolved)
+            return;
+
+        partyListPriorityReflectionResolved = true;
+
+        var statusType = typeof(Status);
+
+        var possibleNames = new[]
+        {
+            "PartyListPriority",
+            "PartyListPrioritySelf",
+            "PartyListPriorityOther",
+            "PartyListPriorityOthers",
+            "StatusPriority",
+            "Priority",
+        };
+
+        foreach (var name in possibleNames)
+        {
+            var property = statusType.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+
+            if (property != null)
+            {
+                partyListPriorityMember = property;
+                return;
+            }
+
+            var field = statusType.GetField(name, BindingFlags.Public | BindingFlags.Instance);
+
+            if (field != null)
+            {
+                partyListPriorityMember = field;
+                return;
+            }
+        }
+    }
+
+    private unsafe void ApplySoloFilterToPartyList(
+        AtkUnitBase* addon,
+        HashSet<uint> hiddenStatusIds,
+        bool debugThisRun)
     {
         if (addon == null)
             return;
@@ -645,24 +922,29 @@ public sealed class Plugin : IDalamudPlugin
         if (battleChara == null)
         {
             if (debugThisRun)
-                Log.Information("[BSE] Solo fallback: could not find a targetable battle character.");
+                Log.Information("[BSE] Solo fallback: could not find a battle character.");
 
+            lastPartyListStatusSignature = string.Empty;
             return;
         }
 
-        var visibleStatusIds = battleChara.StatusList
-            .Where(status => status.StatusId != 0)
-            .Select(status => status.StatusId)
-            .Take(10)
+        var rawStatusIds = GetBattleCharaVisibleStatusIds(battleChara);
+
+        var soloStatusSlotIds = rawStatusIds
+            .Take(MaxPartyStatusSlots)
             .ToList();
 
-        var hiddenSlotIndexes = BuildHiddenSlotIndexes(visibleStatusIds, hiddenStatusIds);
+        var hiddenSoloSlotIndexes = BuildHiddenSlotIndexes(soloStatusSlotIds, hiddenStatusIds);
+
+        lastPartyListStatusSignature =
+            $"solo:{battleChara.GameObjectId}:raw={string.Join(",", rawStatusIds)}:soloSlots={string.Join(",", soloStatusSlotIds)}:hide={string.Join(",", hiddenSoloSlotIndexes.OrderBy(slot => slot))}";
 
         if (debugThisRun)
         {
             Log.Information($"[BSE] Solo fallback name={battleChara.Name}");
-            Log.Information($"[BSE] Solo fallback raw slot map: {FormatSlotMap(visibleStatusIds)}");
-            Log.Information($"[BSE] Solo fallback hidden slots: {string.Join(", ", hiddenSlotIndexes)}");
+            Log.Information($"[BSE] Solo fallback raw status list: {FormatSlotMap(rawStatusIds)}");
+            Log.Information($"[BSE] Solo fallback actual solo slot order used for hiding: {FormatSlotMap(soloStatusSlotIds)}");
+            Log.Information($"[BSE] Solo fallback hidden solo slots: {FormatSlotIndexes(hiddenSoloSlotIndexes)}");
             Log.Information("[BSE] Solo fallback expected row node id: 10");
         }
 
@@ -676,20 +958,130 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        ApplyPartyListStatusVisibilityOnly(rowNode, hiddenSlotIndexes, visibleStatusIds.Count);
+        ApplyPartyListStatusVisibilityOnly(rowNode, hiddenSoloSlotIndexes);
     }
 
-    private HashSet<int> BuildHiddenSlotIndexes(IReadOnlyList<uint> visibleStatusIds, HashSet<uint> hiddenStatusIds)
+    private static List<uint> GetBattleCharaVisibleStatusIds(IBattleChara battleChara)
     {
-        var hiddenSlotIndexes = new HashSet<int>();
+        var result = new List<uint>();
 
-        for (var slotIndex = 0; slotIndex < visibleStatusIds.Count; slotIndex++)
+        foreach (var status in battleChara.StatusList)
         {
-            if (hiddenStatusIds.Contains(visibleStatusIds[slotIndex]))
-                hiddenSlotIndexes.Add(slotIndex);
+            if (status.StatusId == 0)
+                continue;
+
+            result.Add(status.StatusId);
         }
 
-        return hiddenSlotIndexes;
+        return result;
+    }
+
+    private unsafe AtkResNode* FindPartyRowNodeForMember(
+        AtkUnitBase* addon,
+        string partyMemberName,
+        int fallbackPartyIndex,
+        bool debugThisRun)
+    {
+        if (addon == null)
+            return null;
+
+        var normalizedPartyMemberName = NormalizeUiText(partyMemberName);
+
+        if (!string.IsNullOrWhiteSpace(normalizedPartyMemberName))
+        {
+            AtkResNode* matchedRow = null;
+            var matchCount = 0;
+
+            for (var rowNodeId = 10; rowNodeId <= 17; rowNodeId++)
+            {
+                var rowNode = FindPartyRowNode(addon, rowNodeId);
+
+                if (rowNode == null)
+                    continue;
+
+                if (!PartyRowContainsName(rowNode, normalizedPartyMemberName))
+                    continue;
+
+                matchedRow = rowNode;
+                matchCount++;
+            }
+
+            if (matchCount == 1 && matchedRow != null)
+                return matchedRow;
+
+            if (debugThisRun && matchCount > 1)
+                Log.Information($"[BSE] Ambiguous party row name match for '{partyMemberName}'. Matches={matchCount}. Falling back to index row.");
+        }
+
+        var fallbackRowNodeId = 10 + fallbackPartyIndex;
+
+        if (debugThisRun)
+            Log.Information($"[BSE] Falling back to row node id {fallbackRowNodeId} for party index {fallbackPartyIndex} name='{partyMemberName}'.");
+
+        return FindPartyRowNode(addon, fallbackRowNodeId);
+    }
+
+    private unsafe bool PartyRowContainsName(AtkResNode* partyRowNode, string normalizedPartyMemberName)
+    {
+        if (partyRowNode == null)
+            return false;
+
+        if (partyRowNode->Type.ToString() != "1006")
+            return false;
+
+        var componentNode = (AtkComponentNode*)partyRowNode;
+        var component = componentNode->Component;
+
+        if (component == null)
+            return false;
+
+        for (var childIndex = 0; childIndex < component->UldManager.NodeListCount; childIndex++)
+        {
+            var child = component->UldManager.NodeList[childIndex];
+
+            if (child == null)
+                continue;
+
+            if (child->Type.ToString() != "Text")
+                continue;
+
+            var text = ReadAtkTextNode(child);
+            var normalizedText = NormalizeUiText(text);
+
+            if (string.IsNullOrWhiteSpace(normalizedText))
+                continue;
+
+            if (normalizedText.Equals(normalizedPartyMemberName, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (normalizedText.StartsWith(normalizedPartyMemberName + " ", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private unsafe string ReadAtkTextNode(AtkResNode* node)
+    {
+        if (node == null)
+            return string.Empty;
+
+        if (node->Type.ToString() != "Text")
+            return string.Empty;
+
+        var textNode = (AtkTextNode*)node;
+        return textNode->NodeText.ToString();
+    }
+
+    private static string NormalizeUiText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return string.Empty;
+
+        return new string(text
+                .Where(ch => !char.IsControl(ch))
+                .ToArray())
+            .Trim();
     }
 
     private unsafe AtkResNode* FindPartyRowNode(AtkUnitBase* addon, int rowNodeId)
@@ -716,26 +1108,18 @@ public sealed class Plugin : IDalamudPlugin
         return nodeId >= 180001 && nodeId <= 180009;
     }
 
-    private unsafe void HidePartyStatusSlot(AtkResNode* statusNode)
+    private static unsafe bool IsPartyStatusIconNode(AtkResNode* node)
     {
-        if (statusNode == null)
-            return;
+        if (node == null)
+            return false;
 
-        statusNode->ToggleVisibility(false);
-    }
-
-    private unsafe void ShowPartyStatusSlot(AtkResNode* statusNode)
-    {
-        if (statusNode == null)
-            return;
-
-        statusNode->ToggleVisibility(true);
+        return node->Type.ToString() == "1002" &&
+               (node->NodeId == 18 || IsPartyStatusCloneNode(node->NodeId));
     }
 
     private unsafe void ApplyPartyListStatusVisibilityOnly(
         AtkResNode* partyRowNode,
-        HashSet<int> hiddenSlotIndexes,
-        int visibleStatusCount)
+        HashSet<int> hiddenSlotIndexes)
     {
         if (partyRowNode == null)
             return;
@@ -749,37 +1133,288 @@ public sealed class Plugin : IDalamudPlugin
         if (component == null)
             return;
 
-        const int maxStatusSlots = 10;
-        const int firstStatusChildIndex = 5;
-
-        for (var slotIndex = 0; slotIndex < maxStatusSlots; slotIndex++)
+        for (var slotIndex = 0; slotIndex < MaxPartyStatusSlots; slotIndex++)
         {
-            var childIndex = firstStatusChildIndex + slotIndex;
+            var childIndex = FirstPartyStatusChildIndex + slotIndex;
 
             if (childIndex < 0 || childIndex >= component->UldManager.NodeListCount)
                 continue;
 
             var statusNode = component->UldManager.NodeList[childIndex];
 
-            if (statusNode == null)
+            if (!IsPartyStatusIconNode(statusNode))
                 continue;
 
-            var isStatusIconNode =
-                statusNode->Type.ToString() == "1002" &&
-                (statusNode->NodeId == 18 || IsPartyStatusCloneNode(statusNode->NodeId));
-
-            if (!isStatusIconNode)
-                continue;
-
-            var shouldHide =
-                slotIndex >= visibleStatusCount ||
-                hiddenSlotIndexes.Contains(slotIndex);
-
-            if (shouldHide)
-                HidePartyStatusSlot(statusNode);
-            else
-                ShowPartyStatusSlot(statusNode);
+            if (hiddenSlotIndexes.Contains(slotIndex))
+                HidePartyStatusSlotVisibilityOnly(statusNode);
         }
+    }
+
+    private unsafe void HidePartyStatusSlotVisibilityOnly(AtkResNode* statusNode)
+    {
+        if (statusNode == null)
+            return;
+
+        HideNodeVisibilityOnly(statusNode);
+
+        if (statusNode->Type.ToString() != "1002")
+            return;
+
+        var componentNode = (AtkComponentNode*)statusNode;
+        var component = componentNode->Component;
+
+        if (component == null)
+            return;
+
+        for (var innerIndex = 0; innerIndex < component->UldManager.NodeListCount; innerIndex++)
+        {
+            var innerNode = component->UldManager.NodeList[innerIndex];
+
+            if (innerNode == null)
+                continue;
+
+            HideNodeVisibilityOnly(innerNode);
+        }
+    }
+
+    private unsafe void HideNodeVisibilityOnly(AtkResNode* node)
+    {
+        if (node == null)
+            return;
+
+        var address = (nint)node;
+
+        if (!hiddenPartyStatusNodeSnapshots.ContainsKey(address))
+        {
+            hiddenPartyStatusNodeSnapshots[address] = new PartyStatusNodeSnapshot
+            {
+                WasVisible = node->IsVisible(),
+            };
+        }
+
+        node->ToggleVisibility(false);
+    }
+
+    private unsafe void RestorePartyStatusSlotIfBseHidIt(AtkResNode* statusNode)
+    {
+        if (statusNode == null)
+            return;
+
+        RestoreNodeVisibilityIfBseHidIt(statusNode);
+
+        if (statusNode->Type.ToString() != "1002")
+            return;
+
+        var componentNode = (AtkComponentNode*)statusNode;
+        var component = componentNode->Component;
+
+        if (component == null)
+            return;
+
+        for (var innerIndex = 0; innerIndex < component->UldManager.NodeListCount; innerIndex++)
+        {
+            var innerNode = component->UldManager.NodeList[innerIndex];
+
+            if (innerNode == null)
+                continue;
+
+            RestoreNodeVisibilityIfBseHidIt(innerNode);
+        }
+    }
+
+    private unsafe void RestoreNodeVisibilityIfBseHidIt(AtkResNode* node)
+    {
+        if (node == null)
+            return;
+
+        var address = (nint)node;
+
+        if (!hiddenPartyStatusNodeSnapshots.TryGetValue(address, out var snapshot))
+            return;
+
+        node->ToggleVisibility(snapshot.WasVisible);
+        hiddenPartyStatusNodeSnapshots.Remove(address);
+    }
+
+    private unsafe void RestoreHiddenPartyStatusNodesFromLastAddon()
+    {
+        if (lastPartyListAddonAddress == nint.Zero)
+        {
+            hiddenPartyStatusNodeSnapshots.Clear();
+            return;
+        }
+
+        var addon = (AtkUnitBase*)lastPartyListAddonAddress;
+
+        if (addon == null)
+        {
+            hiddenPartyStatusNodeSnapshots.Clear();
+            return;
+        }
+
+        RestoreHiddenPartyStatusNodesInAddon(addon);
+    }
+
+    private unsafe void RestoreHiddenPartyStatusNodesInAddon(AtkUnitBase* addon)
+    {
+        if (addon == null)
+        {
+            hiddenPartyStatusNodeSnapshots.Clear();
+            return;
+        }
+
+        if (hiddenPartyStatusNodeSnapshots.Count == 0)
+            return;
+
+        for (var rowNodeId = 10; rowNodeId <= 17; rowNodeId++)
+        {
+            var rowNode = FindPartyRowNode(addon, rowNodeId);
+
+            if (rowNode == null)
+                continue;
+
+            if (rowNode->Type.ToString() != "1006")
+                continue;
+
+            var rowComponentNode = (AtkComponentNode*)rowNode;
+            var rowComponent = rowComponentNode->Component;
+
+            if (rowComponent == null)
+                continue;
+
+            for (var slotIndex = 0; slotIndex < MaxPartyStatusSlots; slotIndex++)
+            {
+                var childIndex = FirstPartyStatusChildIndex + slotIndex;
+
+                if (childIndex < 0 || childIndex >= rowComponent->UldManager.NodeListCount)
+                    continue;
+
+                var statusNode = rowComponent->UldManager.NodeList[childIndex];
+
+                if (!IsPartyStatusIconNode(statusNode))
+                    continue;
+
+                RestorePartyStatusSlotIfBseHidIt(statusNode);
+            }
+        }
+
+        hiddenPartyStatusNodeSnapshots.Clear();
+    }
+
+    private unsafe void NormalizePartyStatusSlotGeometry(AtkUnitBase* addon, bool debugThisRun)
+    {
+        if (addon == null)
+            return;
+
+        var normalizedNodeCount = 0;
+
+        for (var rowNodeId = 10; rowNodeId <= 17; rowNodeId++)
+        {
+            var rowNode = FindPartyRowNode(addon, rowNodeId);
+
+            if (rowNode == null)
+                continue;
+
+            if (rowNode->Type.ToString() != "1006")
+                continue;
+
+            var rowComponentNode = (AtkComponentNode*)rowNode;
+            var rowComponent = rowComponentNode->Component;
+
+            if (rowComponent == null)
+                continue;
+
+            for (var slotIndex = 0; slotIndex < MaxPartyStatusSlots; slotIndex++)
+            {
+                var childIndex = FirstPartyStatusChildIndex + slotIndex;
+
+                if (childIndex < 0 || childIndex >= rowComponent->UldManager.NodeListCount)
+                    continue;
+
+                var statusNode = rowComponent->UldManager.NodeList[childIndex];
+
+                if (!IsPartyStatusIconNode(statusNode))
+                    continue;
+
+                var expectedX = (short)(PartyStatusSlotBaseX + (slotIndex * PartyStatusSlotSpacingX));
+
+                SetNodeGeometryIfDifferent(
+                    statusNode,
+                    expectedX,
+                    PartyStatusSlotY,
+                    PartyStatusSlotWidth,
+                    PartyStatusSlotHeight,
+                    ref normalizedNodeCount);
+
+                var iconComponentNode = (AtkComponentNode*)statusNode;
+                var iconComponent = iconComponentNode->Component;
+
+                if (iconComponent == null)
+                    continue;
+
+                for (var innerIndex = 0; innerIndex < iconComponent->UldManager.NodeListCount; innerIndex++)
+                {
+                    var innerNode = iconComponent->UldManager.NodeList[innerIndex];
+
+                    if (innerNode == null)
+                        continue;
+
+                    NormalizeInnerStatusNodeGeometry(innerNode, innerIndex, ref normalizedNodeCount);
+                }
+            }
+        }
+
+        if (debugThisRun && normalizedNodeCount > 0)
+            Log.Information($"[BSE] Normalized {normalizedNodeCount} party status node geometries.");
+    }
+
+    private static unsafe void NormalizeInnerStatusNodeGeometry(
+        AtkResNode* innerNode,
+        int innerIndex,
+        ref int normalizedNodeCount)
+    {
+        if (innerNode == null)
+            return;
+
+        switch (innerIndex)
+        {
+            case 0:
+                SetNodeGeometryIfDifferent(innerNode, -4, -4, 32, 12, ref normalizedNodeCount);
+                break;
+
+            case 1:
+                SetNodeGeometryIfDifferent(innerNode, 0, 0, 24, 32, ref normalizedNodeCount);
+                break;
+
+            case 2:
+                SetNodeGeometryIfDifferent(innerNode, 0, 23, 24, 18, ref normalizedNodeCount);
+                break;
+        }
+    }
+
+    private static unsafe void SetNodeGeometryIfDifferent(
+        AtkResNode* node,
+        short x,
+        short y,
+        ushort width,
+        ushort height,
+        ref int changedCount)
+    {
+        if (node == null)
+            return;
+
+        if (node->X == x &&
+            node->Y == y &&
+            node->Width == width &&
+            node->Height == height)
+            return;
+
+        node->X = x;
+        node->Y = y;
+        node->Width = width;
+        node->Height = height;
+
+        changedCount++;
     }
 
     private unsafe void DumpPartyListDebug(AtkUnitBase* addon)
@@ -792,39 +1427,22 @@ public sealed class Plugin : IDalamudPlugin
         Log.Information($"[BSE] Persistent debug enabled: {debugEnabled}");
         Log.Information($"[BSE] PartyList.Length: {PartyList.Length}");
         Log.Information($"[BSE] Addon NodeListCount: {addon->UldManager.NodeListCount}");
+        Log.Information($"[BSE] BSE-hidden-node-count: {hiddenPartyStatusNodeSnapshots.Count}");
+        Log.Information($"[BSE] last status signature: {lastPartyListStatusSignature}");
+        Log.Information($"[BSE] PartyListPriority metadata available: {IsPartyListPriorityMetadataAvailableForDebug()}");
 
         var hiddenStatusIds = LoadHiddenStatusIds();
+        var hiddenStatusIconIds = LoadHiddenStatusIconIds();
 
         Log.Information($"[BSE] Hidden status IDs loaded: {hiddenStatusIds.Count}");
+        Log.Information($"[BSE] Hidden status icon IDs loaded: {hiddenStatusIconIds.Count}");
         Log.Information($"[BSE] Hidden status IDs: {FormatStatusIds(hiddenStatusIds.OrderBy(id => id))}");
+        Log.Information($"[BSE] Hidden icon IDs: {string.Join(", ", hiddenStatusIconIds.OrderBy(id => id))}");
+        Log.Information("[BSE] NOTE: hiding uses COMBAT-SAFE raw status order. It preserves priority-0 combat buffs like Bloodbath and Arm's Length so hidden statuses cannot shift over them.");
 
-        if (PartyList.Length == 0)
-        {
-            var battleChara = ObjectTable
-                .OfType<IBattleChara>()
-                .FirstOrDefault(obj => obj.IsTargetable);
+        var partyCount = Math.Min(PartyList.Length, 8);
 
-            if (battleChara == null)
-            {
-                Log.Information("[BSE] Debug solo slot map: no targetable battle character found.");
-            }
-            else
-            {
-                var visibleStatusIds = battleChara.StatusList
-                    .Where(status => status.StatusId != 0)
-                    .Select(status => status.StatusId)
-                    .Take(10)
-                    .ToList();
-
-                var hiddenSlotIndexes = BuildHiddenSlotIndexes(visibleStatusIds, hiddenStatusIds);
-
-                Log.Information($"[BSE] Debug solo name={battleChara.Name}");
-                Log.Information($"[BSE] Debug solo raw status list: {FormatSlotMap(visibleStatusIds)}");
-                Log.Information($"[BSE] Debug solo hidden slots: {string.Join(", ", hiddenSlotIndexes)}");
-            }
-        }
-
-        for (var partyIndex = 0; partyIndex < PartyList.Length; partyIndex++)
+        for (var partyIndex = 0; partyIndex < partyCount; partyIndex++)
         {
             var partyMember = PartyList[partyIndex];
 
@@ -834,19 +1452,24 @@ public sealed class Plugin : IDalamudPlugin
                 continue;
             }
 
-            var visibleStatusIds = partyMember.Statuses
+            var partyMemberName = partyMember.Name.ToString();
+
+            var rawStatusIds = partyMember.Statuses
                 .Where(status => status.StatusId != 0)
                 .Select(status => status.StatusId)
-                .Take(10)
                 .ToList();
 
-            var hiddenSlotIndexes = BuildHiddenSlotIndexes(visibleStatusIds, hiddenStatusIds);
+            var combatSafePartyListStatusIds = BuildCombatSafePartyListSlotStatusOrder(rawStatusIds, hiddenStatusIds);
+            var hiddenSlotIndexes = BuildHiddenSlotIndexes(combatSafePartyListStatusIds, hiddenStatusIds);
+            var matchedRow = FindPartyRowNodeForMember(addon, partyMemberName, partyIndex, false);
 
             Log.Information($"[BSE] Party index {partyIndex} name={partyMember.Name}");
             Log.Information($"[BSE] Party index {partyIndex} entityId={partyMember.EntityId}");
-            Log.Information($"[BSE] Party index {partyIndex} raw status list: {FormatSlotMap(visibleStatusIds)}");
-            Log.Information($"[BSE] Party index {partyIndex} hidden slots: {string.Join(", ", hiddenSlotIndexes)}");
-            Log.Information($"[BSE] Party index {partyIndex} expected row node id: {10 + partyIndex}");
+            Log.Information($"[BSE] Party index {partyIndex} raw IPartyMember.Statuses: {FormatSlotMap(rawStatusIds)}");
+            Log.Information($"[BSE] Party index {partyIndex} COMBAT-SAFE party-list slot order: {FormatRenderedSlotMap(combatSafePartyListStatusIds)}");
+            Log.Information($"[BSE] Party index {partyIndex} hidden combat-safe slots: {FormatSlotIndexes(hiddenSlotIndexes)}");
+            Log.Information($"[BSE] Party index {partyIndex} fallback row node id: {10 + partyIndex}");
+            Log.Information($"[BSE] Party index {partyIndex} matched row node id: {(matchedRow == null ? "null" : matchedRow->NodeId.ToString())}");
         }
 
         Log.Information("[BSE] ----- Addon nodes -----");
@@ -859,7 +1482,7 @@ public sealed class Plugin : IDalamudPlugin
                 continue;
 
             Log.Information(
-                $"[BSE] AddonNode index={nodeIndex} nodeId={node->NodeId} type={node->Type} visible={node->IsVisible()} x={node->X} y={node->Y} w={node->Width} h={node->Height}"
+                $"[BSE] AddonNode index={nodeIndex} nodeId={node->NodeId} type={node->Type} visible={node->IsVisible()} hiddenByBse={hiddenPartyStatusNodeSnapshots.ContainsKey((nint)node)} x={node->X} y={node->Y} w={node->Width} h={node->Height}"
             );
 
             if (node->NodeId >= 10 && node->NodeId <= 17)
@@ -869,6 +1492,12 @@ public sealed class Plugin : IDalamudPlugin
         Log.Information("[BSE] ===== PARTY DEBUG END =====");
 
         ChatGui.Print("[BSE] Party debug dumped to /xllog.");
+    }
+
+    private bool IsPartyListPriorityMetadataAvailableForDebug()
+    {
+        ResolvePartyListPriorityReflection();
+        return partyListPriorityMember != null;
     }
 
     private unsafe void DumpPartyRowStatusSlots(AtkResNode* partyRowNode, string label)
@@ -899,42 +1528,49 @@ public sealed class Plugin : IDalamudPlugin
         {
             var node = component->UldManager.NodeList[childIndex];
 
-            if (node == null)
-                continue;
-
-            var isStatusIconNode =
-                node->Type.ToString() == "1002" &&
-                (node->NodeId == 18 || IsPartyStatusCloneNode(node->NodeId));
-
-            if (!isStatusIconNode)
+            if (!IsPartyStatusIconNode(node))
                 continue;
 
             statusIconCount++;
 
+            var componentTypeText = "unknown";
+
+            try
+            {
+                var iconComponentNode = (AtkComponentNode*)node;
+
+                if (iconComponentNode->Component != null)
+                    componentTypeText = ((int)iconComponentNode->Component->GetComponentType()).ToString();
+            }
+            catch
+            {
+                componentTypeText = "read-failed";
+            }
+
             Log.Information(
-                $"[BSE] {label}: OUTER childIndex={childIndex} nodeId={node->NodeId} type={node->Type} visible={node->IsVisible()} x={node->X} y={node->Y} w={node->Width} h={node->Height}"
+                $"[BSE] {label}: OUTER childIndex={childIndex} slotIndex={childIndex - FirstPartyStatusChildIndex} nodeId={node->NodeId} type={node->Type} visible={node->IsVisible()} hiddenByBse={hiddenPartyStatusNodeSnapshots.ContainsKey((nint)node)} componentType={componentTypeText} x={node->X} y={node->Y} w={node->Width} h={node->Height}"
             );
 
-            var iconComponentNode = (AtkComponentNode*)node;
-            var iconComponent = iconComponentNode->Component;
+            var outerComponentNode = (AtkComponentNode*)node;
+            var outerComponent = outerComponentNode->Component;
 
-            if (iconComponent == null)
+            if (outerComponent == null)
             {
                 Log.Information($"[BSE] {label}: OUTER nodeId={node->NodeId}: inner component null.");
                 continue;
             }
 
-            Log.Information($"[BSE] {label}: OUTER nodeId={node->NodeId}: inner child count = {iconComponent->UldManager.NodeListCount}");
+            Log.Information($"[BSE] {label}: OUTER nodeId={node->NodeId}: inner child count = {outerComponent->UldManager.NodeListCount}");
 
-            for (var innerIndex = 0; innerIndex < iconComponent->UldManager.NodeListCount; innerIndex++)
+            for (var innerIndex = 0; innerIndex < outerComponent->UldManager.NodeListCount; innerIndex++)
             {
-                var innerNode = iconComponent->UldManager.NodeList[innerIndex];
+                var innerNode = outerComponent->UldManager.NodeList[innerIndex];
 
                 if (innerNode == null)
                     continue;
 
                 Log.Information(
-                    $"[BSE] {label}: INNER outerNodeId={node->NodeId} innerIndex={innerIndex} innerNodeId={innerNode->NodeId} type={innerNode->Type} visible={innerNode->IsVisible()} x={innerNode->X} y={innerNode->Y} w={innerNode->Width} h={innerNode->Height}"
+                    $"[BSE] {label}: INNER outerNodeId={node->NodeId} innerIndex={innerIndex} innerNodeId={innerNode->NodeId} type={innerNode->Type} visible={innerNode->IsVisible()} hiddenByBse={hiddenPartyStatusNodeSnapshots.ContainsKey((nint)innerNode)} x={innerNode->X} y={innerNode->Y} w={innerNode->Width} h={innerNode->Height}"
                 );
             }
         }
@@ -952,6 +1588,16 @@ public sealed class Plugin : IDalamudPlugin
         return "Unknown";
     }
 
+    private uint GetStatusIconId(uint statusId)
+    {
+        var statusSheet = DataManager.GetExcelSheet<Status>();
+
+        if (statusSheet.TryGetRow(statusId, out var statusRow))
+            return statusRow.Icon;
+
+        return 0;
+    }
+
     private string FormatStatusId(uint statusId)
     {
         return $"{statusId} {GetStatusName(statusId)}";
@@ -959,17 +1605,69 @@ public sealed class Plugin : IDalamudPlugin
 
     private string FormatStatusIds(IEnumerable<uint> statusIds)
     {
-        return string.Join(", ", statusIds.Select(FormatStatusId));
+        return string.Join(", ", statusIds.Select(id =>
+        {
+            var priorityText = TryGetPartyListPriority(id, out var priority)
+                ? priority.ToString()
+                : "unknown";
+
+            return $"{FormatStatusId(id)} icon={GetStatusIconId(id)} priority={priorityText}";
+        }));
     }
 
     private string FormatSlotMap(IReadOnlyList<uint> statusIds)
     {
+        if (statusIds.Count == 0)
+            return "(none)";
+
         var parts = new List<string>();
 
         for (var i = 0; i < statusIds.Count; i++)
             parts.Add($"{i}={FormatStatusId(statusIds[i])}");
 
         return string.Join(", ", parts);
+    }
+
+    private string FormatRenderedSlotMap(IReadOnlyList<uint> statusIds)
+    {
+        if (statusIds.Count == 0)
+            return "(none)";
+
+        var parts = new List<string>();
+
+        for (var i = 0; i < statusIds.Count; i++)
+        {
+            var statusId = statusIds[i];
+
+            if (TryGetPartyListPriority(statusId, out var priority))
+                parts.Add($"{i}={FormatStatusId(statusId)} priority={priority}");
+            else
+                parts.Add($"{i}={FormatStatusId(statusId)} priority=(unknown)");
+        }
+
+        return string.Join(", ", parts);
+    }
+
+    private static string FormatSlotIndexes(HashSet<int> slotIndexes)
+    {
+        return slotIndexes.Count == 0
+            ? "(none)"
+            : string.Join(", ", slotIndexes.OrderBy(index => index));
+    }
+
+    private sealed class PartyMemberRenderState
+    {
+        public int PartyIndex { get; set; }
+        public string PartyMemberName { get; set; } = string.Empty;
+        public string PartyMemberKey { get; set; } = string.Empty;
+        public List<uint> RawStatusIds { get; set; } = new();
+        public List<uint> PartyListSlotStatusIds { get; set; } = new();
+        public HashSet<int> HiddenSlotIndexes { get; set; } = new();
+    }
+
+    private sealed class PartyStatusNodeSnapshot
+    {
+        public bool WasVisible { get; set; }
     }
 
     private sealed class StatusCategoryEntry
